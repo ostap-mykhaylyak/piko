@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/ostap-mykhaylyak/piko/internal/config"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
 	"github.com/ostap-mykhaylyak/piko/internal/profile"
+	"github.com/ostap-mykhaylyak/piko/internal/rewrite"
 )
 
 // maxTrackedTxWrites caps the write statements remembered inside one
@@ -32,12 +34,13 @@ const maxTrackedTxWrites = 128
 // backend connection is lost anyway, the next command transparently attaches
 // a fresh one from the pool.
 type session struct {
-	ctx   context.Context
-	pool  *pool.Pool
-	cfg   config.Pool
-	cache *cache.Cache      // nil when disabled
-	prof  *profile.Profiler // nil when disabled
-	log   *slog.Logger
+	ctx      context.Context
+	pool     *pool.Pool
+	cfg      config.Pool
+	cache    *cache.Cache      // nil when disabled
+	prof     *profile.Profiler // nil when disabled
+	rewriter *rewrite.Rewriter // nil when disabled
+	log      *slog.Logger
 
 	mu      sync.Mutex // guards conn, db, lastUse against the pinger
 	conn    *pool.Conn
@@ -54,13 +57,14 @@ type session struct {
 	pingDone chan struct{}
 }
 
-func newSession(ctx context.Context, p *pool.Pool, cfg config.Pool, qc *cache.Cache, prof *profile.Profiler, log *slog.Logger) *session {
+func newSession(ctx context.Context, srv *Server, log *slog.Logger) *session {
 	s := &session{
 		ctx:      ctx,
-		pool:     p,
-		cfg:      cfg,
-		cache:    qc,
-		prof:     prof,
+		pool:     srv.pool,
+		cfg:      srv.cfg,
+		cache:    srv.cache,
+		prof:     srv.prof,
+		rewriter: srv.rewriter,
 		log:      log,
 		lastUse:  time.Now(),
 		stopPing: make(chan struct{}),
@@ -189,6 +193,13 @@ func (s *session) UseDB(dbName string) error {
 func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.rewriter != nil {
+		if rewritten, applied := s.rewriter.Apply(query); len(applied) > 0 {
+			s.log.Debug("query rewritten", "rules", strings.Join(applied, ","), "query", rewritten)
+			query = rewritten
+		}
+	}
 
 	kind := cache.KindOther
 	if s.cacheActive() {

@@ -71,6 +71,10 @@ profiling:
   # suggestions: missing indexes (with the ALTER TABLE ready to run),
   # redundant indexes and indexes never used since the MySQL server started.
   suggest_indexes: true
+  # Scan queries for known antipatterns (ORDER BY RAND(),
+  # SQL_CALC_FOUND_ROWS, leading-wildcard LIKE, large OFFSET) and log the
+  # conf.d rewrite rule ready to configure.
+  suggest_rewrites: true
 
 log:
   level: info           # debug | info | warn | error

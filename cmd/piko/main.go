@@ -18,6 +18,7 @@ import (
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
 	"github.com/ostap-mykhaylyak/piko/internal/profile"
 	"github.com/ostap-mykhaylyak/piko/internal/proxy"
+	"github.com/ostap-mykhaylyak/piko/internal/rewrite"
 )
 
 const defaultConfigPath = "/etc/piko/config.yaml"
@@ -106,19 +107,30 @@ func run(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// conf.d drop-ins carry cache rules and query rewrites; rewrites apply
+	// even when the cache is disabled.
+	rulesDir := cfg.Cache.RulesDir
+	if rulesDir == "" {
+		rulesDir = filepath.Join(filepath.Dir(configPath), "conf.d")
+	}
+	cacheRules, rewriteRules, err := cache.LoadRuleDir(rulesDir)
+	if err != nil {
+		return err
+	}
+
 	var qc *cache.Cache
 	if cfg.Cache.Enabled {
-		rulesDir := cfg.Cache.RulesDir
-		if rulesDir == "" {
-			rulesDir = filepath.Join(filepath.Dir(configPath), "conf.d")
-		}
-		rules, err := cache.LoadRuleDir(rulesDir)
-		if err != nil {
+		qc = cache.New(cfg.Cache, cacheRules, log)
+		log.Info("query cache enabled",
+			"table_prefix", cfg.Cache.TablePrefix, "rules", len(cacheRules), "rules_dir", rulesDir)
+	}
+
+	var rw *rewrite.Rewriter
+	if len(rewriteRules) > 0 {
+		if rw, err = rewrite.New(rewriteRules, log); err != nil {
 			return err
 		}
-		qc = cache.New(cfg.Cache, rules, log)
-		log.Info("query cache enabled",
-			"table_prefix", cfg.Cache.TablePrefix, "rules", len(rules), "rules_dir", rulesDir)
+		log.Info("query rewriting enabled", "rules", rw.Len(), "rules_dir", rulesDir)
 	}
 
 	backendPool := pool.New(cfg.Backend, cfg.Pool, log, nil)
@@ -134,7 +146,16 @@ func run(configPath string) error {
 			"suggest_indexes", cfg.Profiling.SuggestIndexes)
 	}
 
-	srv := proxy.New(cfg.Listen.Address, cfg.Users, cfg.Pool, backendPool, qc, prof, log)
+	srv := proxy.New(proxy.Options{
+		Addr:     cfg.Listen.Address,
+		Users:    cfg.Users,
+		PoolCfg:  cfg.Pool,
+		Pool:     backendPool,
+		Cache:    qc,
+		Profiler: prof,
+		Rewriter: rw,
+		Log:      log,
+	})
 	if err := srv.Run(ctx); err != nil {
 		return err
 	}

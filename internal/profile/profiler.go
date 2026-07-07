@@ -176,6 +176,9 @@ func (p *Profiler) report(ctx context.Context) {
 			"query", st.digest)
 	}
 
+	if p.cfg.SuggestRewrites {
+		p.suggestRewrites(stats)
+	}
 	if p.cfg.SuggestIndexes {
 		p.suggest(ctx, top, dbs)
 	}

@@ -206,16 +206,33 @@ rules:
 		t.Fatal(err)
 	}
 
-	rules, err := LoadRuleDir(dir)
+	rules, rewrites, err := LoadRuleDir(dir)
 	if err != nil {
 		t.Fatalf("LoadRuleDir: %v", err)
 	}
 	if len(rules) != 1 || rules[0].Name != "r1" || rules[0].re == nil {
 		t.Fatalf("rules = %+v", rules)
 	}
+	if len(rewrites) != 0 {
+		t.Fatalf("rewrites = %+v, want none", rewrites)
+	}
+
+	// A file with rewrites loads them too.
+	withRewrites := `
+rewrites:
+  - name: no-rand
+    match: "(?i)\\s*ORDER\\s+BY\\s+RAND\\(\\)"
+    replace: ""
+`
+	if err := os.WriteFile(filepath.Join(dir, "15-rw.yaml"), []byte(withRewrites), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, rewrites, err = LoadRuleDir(dir); err != nil || len(rewrites) != 1 {
+		t.Fatalf("rewrites = %+v (err %v), want 1", rewrites, err)
+	}
 
 	// Missing directory is fine.
-	if rules, err := LoadRuleDir(filepath.Join(dir, "missing")); err != nil || rules != nil {
+	if rules, _, err := LoadRuleDir(filepath.Join(dir, "missing")); err != nil || rules != nil {
 		t.Fatalf("missing dir: rules=%v err=%v", rules, err)
 	}
 
@@ -224,7 +241,7 @@ rules:
 	if err := os.WriteFile(filepath.Join(dir, "20-bad.yaml"), []byte(bad), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadRuleDir(dir); err == nil {
+	if _, _, err := LoadRuleDir(dir); err == nil {
 		t.Fatal("expected error for invalid regex")
 	}
 }

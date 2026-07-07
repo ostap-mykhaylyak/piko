@@ -19,16 +19,31 @@ import (
 	"github.com/ostap-mykhaylyak/piko/internal/config"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
 	"github.com/ostap-mykhaylyak/piko/internal/profile"
+	"github.com/ostap-mykhaylyak/piko/internal/rewrite"
 )
+
+// Options wires the Server's collaborators; Cache, Profiler and Rewriter
+// are optional.
+type Options struct {
+	Addr     string
+	Users    []config.User
+	PoolCfg  config.Pool
+	Pool     *pool.Pool
+	Cache    *cache.Cache
+	Profiler *profile.Profiler
+	Rewriter *rewrite.Rewriter
+	Log      *slog.Logger
+}
 
 // Server accepts client connections and serves the MySQL protocol.
 type Server struct {
-	addr  string
-	pool  *pool.Pool
-	cfg   config.Pool
-	cache *cache.Cache      // nil when disabled
-	prof  *profile.Profiler // nil when disabled
-	log   *slog.Logger
+	addr     string
+	pool     *pool.Pool
+	cfg      config.Pool
+	cache    *cache.Cache      // nil when disabled
+	prof     *profile.Profiler // nil when disabled
+	rewriter *rewrite.Rewriter // nil when disabled
+	log      *slog.Logger
 
 	srvConf *server.Server
 	auth    *server.InMemoryAuthenticationHandler
@@ -37,27 +52,28 @@ type Server struct {
 	clients sync.Map // net.Conn -> struct{}, open client sockets
 }
 
-// New creates a Server; call Run to start serving. qc and prof may be nil.
-func New(addr string, users []config.User, poolCfg config.Pool, p *pool.Pool, qc *cache.Cache, prof *profile.Profiler, log *slog.Logger) *Server {
+// New creates a Server; call Run to start serving.
+func New(o Options) *Server {
 	// mysql_native_password keeps compatibility with every PHP/mysqli and
 	// mysqlnd version WordPress runs on.
 	srvConf := server.NewServer("8.0.36-piko", mysql.DEFAULT_COLLATION_ID,
 		mysql.AUTH_NATIVE_PASSWORD, nil, nil)
 	auth := server.NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
-	for _, u := range users {
+	for _, u := range o.Users {
 		// AddUser only fails for unknown auth plugins, which is fixed here.
 		_ = auth.AddUser(u.Username, u.Password)
 	}
 
 	return &Server{
-		addr:    addr,
-		pool:    p,
-		cfg:     poolCfg,
-		cache:   qc,
-		prof:    prof,
-		log:     log,
-		srvConf: srvConf,
-		auth:    auth,
+		addr:     o.Addr,
+		pool:     o.Pool,
+		cfg:      o.PoolCfg,
+		cache:    o.Cache,
+		prof:     o.Profiler,
+		rewriter: o.Rewriter,
+		log:      o.Log,
+		srvConf:  srvConf,
+		auth:     auth,
 	}
 }
 
@@ -106,7 +122,7 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) handle(ctx context.Context, clientConn net.Conn) {
 	defer clientConn.Close()
 
-	sess := newSession(ctx, s.pool, s.cfg, s.cache, s.prof, s.log.With("client", clientConn.RemoteAddr()))
+	sess := newSession(ctx, s, s.log.With("client", clientConn.RemoteAddr()))
 	defer sess.close()
 
 	// Handshake: authenticates the client and, when it selects a database,

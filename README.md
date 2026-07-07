@@ -133,6 +133,36 @@ Unique indexes and primary keys are never suggested for removal, and
 suggestions on JOIN queries are limited to flagging the scan — piko does not
 guess composite indexes across tables.
 
+### Query rewriting
+
+conf.d drop-ins can also declare `rewrites:` — regex replacements applied to
+every query before execution, useful to fix known-bad SQL coming from
+plugins you cannot change:
+
+```yaml
+rewrites:
+  - name: remove-order-by-rand
+    match: "(?i)\\s*ORDER\\s+BY\\s+RAND\\s*\\(\\s*\\)"
+    replace: ""
+```
+
+`replace` supports capture references (`$1`); an empty string deletes the
+match. Rewrites change query semantics, so none ship enabled: with profiling
+on, piko detects the known antipatterns — `ORDER BY RAND()`,
+`SQL_CALC_FOUND_ROWS`, leading-wildcard `LIKE`, huge `OFFSET` pagination —
+and logs a `rewrite suggestion` entry with the exact conf.d rule to enable
+(or advice when no automatic fix is safe):
+
+```
+WARN rewrite suggestion pattern=order-by-rand calls=1250
+     reason="ORDER BY RAND() reads and sorts the whole table on every execution; ..."
+     query="SELECT ID FROM wp_posts ORDER BY RAND() LIMIT ?"
+     conf_d="rewrites: [{name: remove-order-by-rand, match: '(?i)\s*ORDER\s+BY\s+RAND\s*\(\s*\)', replace: ''}]"
+```
+
+Prepared statements are never rewritten. The WooCommerce drop-in ships the
+two most common rewrites commented out, ready to enable.
+
 ### Custom cache rules (conf.d)
 
 Every `*.yaml` file in the conf.d directory adds cache rules. A rule caches

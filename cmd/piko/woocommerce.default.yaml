@@ -34,3 +34,23 @@ rules:
     match: "(?i)^SELECT t\\.\\*, tt\\.\\* FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt"
     ttl: 5m
     invalidate_on: [wp_terms, wp_term_taxonomy, wp_term_relationships]
+
+# Query rewrites: each rule replaces every regex match in the query text
+# before execution (replace supports $1 capture references; empty deletes
+# the match). Disabled by default because rewrites change semantics — enable
+# them after checking the "rewrite suggestion" entries piko's profiling
+# writes to the log.
+#
+# rewrites:
+#   # ORDER BY RAND() sorts the whole table on every execution. Removing it
+#   # makes the row order undefined — fine for "random-ish product" widgets.
+#   - name: remove-order-by-rand
+#     match: "(?i)\\s*ORDER\\s+BY\\s+RAND\\s*\\(\\s*\\)"
+#     replace: ""
+#
+#   # SQL_CALC_FOUND_ROWS counts all rows past the LIMIT. Enable ONLY if
+#   # nothing reads FOUND_ROWS() afterwards (in WordPress prefer
+#   # 'no_found_rows' => true in WP_Query).
+#   - name: remove-sql-calc-found-rows
+#     match: "(?i)SQL_CALC_FOUND_ROWS\\s+"
+#     replace: ""

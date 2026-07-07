@@ -183,6 +183,46 @@ func TestSchemaReviewFindsDuplicatesAndUnused(t *testing.T) {
 	}
 }
 
+func TestSuggestRewrites(t *testing.T) {
+	log, buf := testLogger()
+	cfg := config.Default().Profiling
+	p := New(cfg, nil, log)
+
+	stats := []*queryStat{
+		{digest: "SELECT ID FROM wp_posts ORDER BY RAND() LIMIT ?",
+			sample: "SELECT ID FROM wp_posts ORDER BY RAND() LIMIT 1", calls: 40},
+		{digest: "SELECT SQL_CALC_FOUND_ROWS ID FROM wp_posts LIMIT ?",
+			sample: "SELECT SQL_CALC_FOUND_ROWS ID FROM wp_posts LIMIT 10", calls: 12},
+		{digest: "SELECT * FROM wp_posts WHERE post_title LIKE ?",
+			sample: "SELECT * FROM wp_posts WHERE post_title LIKE '%shoes%'", calls: 5},
+		{digest: "SELECT ID FROM wp_posts LIMIT ?, ?",
+			sample: "SELECT ID FROM wp_posts LIMIT 200000, 10", calls: 2},
+		{digest: "SELECT * FROM clean", sample: "SELECT * FROM clean", calls: 100},
+	}
+	p.suggestRewrites(stats)
+
+	out := buf.String()
+	for _, want := range []string{"order-by-rand", "sql-calc-found-rows", "leading-wildcard-like", "large-offset"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %s suggestion, log was:\n%s", want, out)
+		}
+	}
+	// Rewritable patterns include the ready conf.d rule.
+	if !strings.Contains(out, "remove-order-by-rand") {
+		t.Errorf("expected ready-to-paste conf.d rule, log was:\n%s", out)
+	}
+	if strings.Contains(out, "clean") {
+		t.Errorf("clean query flagged, log was:\n%s", out)
+	}
+
+	// Second pass: everything already suggested, nothing new logged.
+	buf.Reset()
+	p.suggestRewrites(stats)
+	if strings.Contains(buf.String(), "rewrite suggestion") {
+		t.Fatal("suggestions must be emitted only once per digest")
+	}
+}
+
 func TestObserveAndSlowLog(t *testing.T) {
 	log, buf := testLogger()
 	cfg := config.Default().Profiling

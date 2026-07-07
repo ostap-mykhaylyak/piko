@@ -16,12 +16,14 @@ import (
 	"github.com/ostap-mykhaylyak/piko/internal/cache"
 	"github.com/ostap-mykhaylyak/piko/internal/config"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
+	"github.com/ostap-mykhaylyak/piko/internal/rewrite"
 )
 
 // fakeCounters tracks what the fake backend observed.
 type fakeCounters struct {
-	accepted atomic.Int64
-	queries  atomic.Int64
+	accepted  atomic.Int64
+	queries   atomic.Int64
+	lastQuery atomic.Value // string
 }
 
 // fakeHandler answers every SELECT with a single-value resultset, every
@@ -32,6 +34,7 @@ type fakeHandler struct{ counters *fakeCounters }
 func (fakeHandler) UseDB(string) error { return nil }
 func (h fakeHandler) HandleQuery(query string) (*mysql.Result, error) {
 	h.counters.queries.Add(1)
+	h.counters.lastQuery.Store(query)
 	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "SELECT") {
 		return &mysql.Result{AffectedRows: 1}, nil
 	}
@@ -94,6 +97,7 @@ type pikoOpts struct {
 	pingInterval time.Duration
 	dialer       pool.Dialer
 	cache        *cache.Cache
+	rewriter     *rewrite.Rewriter
 }
 
 // startPiko runs the full stack (pool + proxy) against the fake backend.
@@ -127,7 +131,15 @@ func startPikoWith(t *testing.T, backendAddr string, opts pikoOpts) string {
 	ln.Close() // free the port for the server
 
 	users := []config.User{{Username: "wordpress", Password: "apppass"}}
-	srv := New(addr, users, poolCfg, p, opts.cache, nil, log)
+	srv := New(Options{
+		Addr:     addr,
+		Users:    users,
+		PoolCfg:  poolCfg,
+		Pool:     p,
+		Cache:    opts.cache,
+		Rewriter: opts.rewriter,
+		Log:      log,
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.Run(ctx) }()
@@ -227,6 +239,33 @@ func TestIdleSessionKeepalive(t *testing.T) {
 	// After the pause the session must still work.
 	if _, err := conn.Execute("INSERT INTO t VALUES (1)"); err != nil {
 		t.Fatalf("query after idle pause: %v", err)
+	}
+}
+
+// TestQueryRewrite: configured rewrites are applied before the query
+// reaches the backend.
+func TestQueryRewrite(t *testing.T) {
+	backendAddr, counters := startFakeMySQL(t, "piko", "backendpass")
+
+	rw, err := rewrite.New([]rewrite.Rule{
+		{Name: "no-rand", Match: `(?i)\s*ORDER\s+BY\s+RAND\s*\(\s*\)`, Replace: ""},
+	}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pikoAddr := startPikoWith(t, backendAddr, pikoOpts{rewriter: rw})
+
+	conn, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Execute("SELECT ID FROM wp_posts ORDER BY RAND() LIMIT 1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := counters.lastQuery.Load(); got != "SELECT ID FROM wp_posts LIMIT 1" {
+		t.Fatalf("backend received %q, want the rewritten query", got)
 	}
 }
 

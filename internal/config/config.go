@@ -94,6 +94,9 @@ type Profiling struct {
 	// SuggestIndexes runs EXPLAIN on the heaviest queries and inspects the
 	// schema, logging missing/duplicate/unused index suggestions.
 	SuggestIndexes bool `yaml:"suggest_indexes"`
+	// SuggestRewrites scans queries for known antipatterns (ORDER BY
+	// RAND()...) and logs the conf.d rewrite rule to configure.
+	SuggestRewrites bool `yaml:"suggest_rewrites"`
 }
 
 // Log controls logging output.
@@ -126,10 +129,11 @@ func Default() Config {
 			MaxResultBytes:  1 << 20, // 1 MiB
 		},
 		Profiling: Profiling{
-			SlowQuery:      500 * time.Millisecond,
-			ReportInterval: 10 * time.Minute,
-			TopQueries:     20,
-			SuggestIndexes: true,
+			SlowQuery:       500 * time.Millisecond,
+			ReportInterval:  10 * time.Minute,
+			TopQueries:      20,
+			SuggestIndexes:  true,
+			SuggestRewrites: true,
 		},
 		Log: Log{Level: "info", Format: "text", Path: "/var/log/piko"},
 	}
