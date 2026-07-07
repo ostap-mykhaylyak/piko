@@ -13,12 +13,13 @@ import (
 
 // Config is the root of config.yaml.
 type Config struct {
-	Listen  Listen  `yaml:"listen"`
-	Backend Backend `yaml:"backend"`
-	Users   []User  `yaml:"users"`
-	Pool    Pool    `yaml:"pool"`
-	Cache   Cache   `yaml:"cache"`
-	Log     Log     `yaml:"log"`
+	Listen    Listen    `yaml:"listen"`
+	Backend   Backend   `yaml:"backend"`
+	Users     []User    `yaml:"users"`
+	Pool      Pool      `yaml:"pool"`
+	Cache     Cache     `yaml:"cache"`
+	Profiling Profiling `yaml:"profiling"`
+	Log       Log       `yaml:"log"`
 }
 
 // Listen configures the client-facing listener.
@@ -80,6 +81,21 @@ type Cache struct {
 	RulesDir string `yaml:"rules_dir"`
 }
 
+// Profiling controls query statistics, slow query logging and index
+// suggestions, all emitted through the log.
+type Profiling struct {
+	Enabled bool `yaml:"enabled"`
+	// SlowQuery logs any statement slower than this immediately (0 = off).
+	SlowQuery time.Duration `yaml:"slow_query"`
+	// ReportInterval is how often the aggregated query report is logged.
+	ReportInterval time.Duration `yaml:"report_interval"`
+	// TopQueries is how many queries the report details, heaviest first.
+	TopQueries int `yaml:"top_queries"`
+	// SuggestIndexes runs EXPLAIN on the heaviest queries and inspects the
+	// schema, logging missing/duplicate/unused index suggestions.
+	SuggestIndexes bool `yaml:"suggest_indexes"`
+}
+
 // Log controls logging output.
 type Log struct {
 	Level  string `yaml:"level"`
@@ -108,6 +124,12 @@ func Default() Config {
 			DefaultTTL:      5 * time.Minute,
 			MaxEntries:      10000,
 			MaxResultBytes:  1 << 20, // 1 MiB
+		},
+		Profiling: Profiling{
+			SlowQuery:      500 * time.Millisecond,
+			ReportInterval: 10 * time.Minute,
+			TopQueries:     20,
+			SuggestIndexes: true,
 		},
 		Log: Log{Level: "info", Format: "text", Path: "/var/log/piko"},
 	}
@@ -189,6 +211,17 @@ func (c *Config) Validate() error {
 		}
 		if c.Cache.MaxResultBytes < 1 {
 			return fmt.Errorf("cache.max_result_bytes must be >= 1")
+		}
+	}
+	if c.Profiling.Enabled {
+		if c.Profiling.ReportInterval <= 0 {
+			return fmt.Errorf("profiling.report_interval must be > 0")
+		}
+		if c.Profiling.TopQueries < 1 {
+			return fmt.Errorf("profiling.top_queries must be >= 1")
+		}
+		if c.Profiling.SlowQuery < 0 {
+			return fmt.Errorf("profiling.slow_query must be >= 0 (0 disables it)")
 		}
 	}
 	switch c.Log.Level {

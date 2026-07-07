@@ -31,7 +31,7 @@ func (fakeHandler) HandleStmtPrepare(string) (int, int, any, error)        { ret
 func (fakeHandler) HandleStmtExecute(any, string, []any) (*mysql.Result, error) {
 	return nil, nil
 }
-func (fakeHandler) HandleStmtClose(any) error          { return nil }
+func (fakeHandler) HandleStmtClose(any) error             { return nil }
 func (fakeHandler) HandleOtherCommand(byte, []byte) error { return nil }
 
 // startFakeMySQL runs an in-process MySQL server and returns its address

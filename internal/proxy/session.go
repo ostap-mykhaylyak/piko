@@ -13,6 +13,7 @@ import (
 	"github.com/ostap-mykhaylyak/piko/internal/cache"
 	"github.com/ostap-mykhaylyak/piko/internal/config"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
+	"github.com/ostap-mykhaylyak/piko/internal/profile"
 )
 
 // maxTrackedTxWrites caps the write statements remembered inside one
@@ -34,7 +35,8 @@ type session struct {
 	ctx   context.Context
 	pool  *pool.Pool
 	cfg   config.Pool
-	cache *cache.Cache // nil when disabled
+	cache *cache.Cache      // nil when disabled
+	prof  *profile.Profiler // nil when disabled
 	log   *slog.Logger
 
 	mu      sync.Mutex // guards conn, db, lastUse against the pinger
@@ -52,12 +54,13 @@ type session struct {
 	pingDone chan struct{}
 }
 
-func newSession(ctx context.Context, p *pool.Pool, cfg config.Pool, qc *cache.Cache, log *slog.Logger) *session {
+func newSession(ctx context.Context, p *pool.Pool, cfg config.Pool, qc *cache.Cache, prof *profile.Profiler, log *slog.Logger) *session {
 	s := &session{
 		ctx:      ctx,
 		pool:     p,
 		cfg:      cfg,
 		cache:    qc,
+		prof:     prof,
 		log:      log,
 		lastUse:  time.Now(),
 		stopPing: make(chan struct{}),
@@ -195,6 +198,7 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 		if kind == cache.KindSelect && !s.inTx {
 			if r, ok := s.cache.Lookup(s.db, query); ok {
 				s.lastUse = time.Now()
+				s.profile(query, 0, r, true, nil)
 				return r, nil
 			}
 		}
@@ -204,8 +208,10 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	start := time.Now()
 	r, err := c.Execute(query)
 	s.finish(err)
+	s.profile(query, time.Since(start), r, false, err)
 	if err != nil {
 		return r, err
 	}
@@ -214,6 +220,23 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 		s.observe(kind, query, r)
 	}
 	return r, nil
+}
+
+// profile forwards one execution to the profiler, when enabled.
+// Must be called with s.mu held.
+func (s *session) profile(query string, dur time.Duration, r *mysql.Result, cached bool, err error) {
+	if s.prof == nil {
+		return
+	}
+	var rows uint64
+	if r != nil {
+		if r.HasResultset() {
+			rows = uint64(len(r.Values))
+		} else {
+			rows = r.AffectedRows
+		}
+	}
+	s.prof.Observe(s.db, query, dur, rows, cached, err)
 }
 
 // cacheActive reports whether this session may use the query cache.
@@ -315,8 +338,10 @@ func (s *session) HandleStmtExecute(context any, query string, args []any) (*mys
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	start := time.Now()
 	r, err := stmt.Execute(args...)
 	s.finish(err)
+	s.profile(query, time.Since(start), r, false, err)
 	if err == nil && s.cacheActive() {
 		// Prepared reads are never cached, but prepared writes still have
 		// to invalidate what they touch.

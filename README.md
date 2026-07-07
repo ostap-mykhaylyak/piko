@@ -101,6 +101,38 @@ users:
     password: "proxy-only-password"
 ```
 
+### Profiling and index suggestions
+
+With `profiling.enabled: true`, piko turns its privileged position — it sees
+every query — into optimization guidance, written to the standard log:
+
+- **slow query log**: statements slower than `slow_query` are logged
+  immediately with their duration and full text;
+- **periodic report** (`report_interval`): per-query statistics aggregated by
+  normalized query (literals replaced by `?`): calls, total/avg/max time,
+  rows, cache hit ratio, heaviest queries first;
+- **index suggestions** (`suggest_indexes`): piko runs `EXPLAIN` on the
+  heaviest queries and inspects the schema, logging each finding once with
+  the `ALTER TABLE` statement ready to run:
+  - *add*: a query scans a large table without using any index;
+  - *drop (redundant)*: an index is a left prefix of another one;
+  - *drop (unused)*: an index with zero reads since the MySQL server started
+    (requires `performance_schema`); verify over a full business cycle
+    before dropping.
+
+```yaml
+profiling:
+  enabled: true
+  slow_query: 500ms
+  report_interval: 10m
+  top_queries: 20
+  suggest_indexes: true
+```
+
+Unique indexes and primary keys are never suggested for removal, and
+suggestions on JOIN queries are limited to flagging the scan — piko does not
+guess composite indexes across tables.
+
 ### Custom cache rules (conf.d)
 
 Every `*.yaml` file in the conf.d directory adds cache rules. A rule caches

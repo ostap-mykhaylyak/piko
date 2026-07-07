@@ -56,6 +56,22 @@ cache:
   # Default: the conf.d directory next to this file.
   # rules_dir: /etc/piko/conf.d
 
+profiling:
+  # Query profiling: statistics, slow query log and index suggestions,
+  # all written to piko's log.
+  enabled: false
+  # Log statements slower than this immediately (0 disables it).
+  slow_query: 500ms
+  # How often the aggregated report is logged: per-query calls, total/avg/max
+  # time, rows, cache hit ratio, heaviest queries first.
+  report_interval: 10m
+  # How many queries the report details.
+  top_queries: 20
+  # Run EXPLAIN on the heaviest queries and inspect the schema, logging
+  # suggestions: missing indexes (with the ALTER TABLE ready to run),
+  # redundant indexes and indexes never used since the MySQL server started.
+  suggest_indexes: true
+
 log:
   level: info           # debug | info | warn | error
   format: text          # text | json

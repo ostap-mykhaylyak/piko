@@ -16,6 +16,7 @@ import (
 	"github.com/ostap-mykhaylyak/piko/internal/cache"
 	"github.com/ostap-mykhaylyak/piko/internal/config"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
+	"github.com/ostap-mykhaylyak/piko/internal/profile"
 	"github.com/ostap-mykhaylyak/piko/internal/proxy"
 )
 
@@ -123,7 +124,17 @@ func run(configPath string) error {
 	backendPool := pool.New(cfg.Backend, cfg.Pool, log, nil)
 	defer backendPool.Close()
 
-	srv := proxy.New(cfg.Listen.Address, cfg.Users, cfg.Pool, backendPool, qc, log)
+	var prof *profile.Profiler
+	if cfg.Profiling.Enabled {
+		prof = profile.New(cfg.Profiling, backendPool, log)
+		go prof.Run(ctx)
+		log.Info("profiling enabled",
+			"slow_query", cfg.Profiling.SlowQuery,
+			"report_interval", cfg.Profiling.ReportInterval,
+			"suggest_indexes", cfg.Profiling.SuggestIndexes)
+	}
+
+	srv := proxy.New(cfg.Listen.Address, cfg.Users, cfg.Pool, backendPool, qc, prof, log)
 	if err := srv.Run(ctx); err != nil {
 		return err
 	}

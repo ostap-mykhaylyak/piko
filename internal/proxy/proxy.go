@@ -18,6 +18,7 @@ import (
 	"github.com/ostap-mykhaylyak/piko/internal/cache"
 	"github.com/ostap-mykhaylyak/piko/internal/config"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
+	"github.com/ostap-mykhaylyak/piko/internal/profile"
 )
 
 // Server accepts client connections and serves the MySQL protocol.
@@ -25,7 +26,8 @@ type Server struct {
 	addr  string
 	pool  *pool.Pool
 	cfg   config.Pool
-	cache *cache.Cache // nil when disabled
+	cache *cache.Cache      // nil when disabled
+	prof  *profile.Profiler // nil when disabled
 	log   *slog.Logger
 
 	srvConf *server.Server
@@ -35,8 +37,8 @@ type Server struct {
 	clients sync.Map // net.Conn -> struct{}, open client sockets
 }
 
-// New creates a Server; call Run to start serving. qc may be nil.
-func New(addr string, users []config.User, poolCfg config.Pool, p *pool.Pool, qc *cache.Cache, log *slog.Logger) *Server {
+// New creates a Server; call Run to start serving. qc and prof may be nil.
+func New(addr string, users []config.User, poolCfg config.Pool, p *pool.Pool, qc *cache.Cache, prof *profile.Profiler, log *slog.Logger) *Server {
 	// mysql_native_password keeps compatibility with every PHP/mysqli and
 	// mysqlnd version WordPress runs on.
 	srvConf := server.NewServer("8.0.36-piko", mysql.DEFAULT_COLLATION_ID,
@@ -52,6 +54,7 @@ func New(addr string, users []config.User, poolCfg config.Pool, p *pool.Pool, qc
 		pool:    p,
 		cfg:     poolCfg,
 		cache:   qc,
+		prof:    prof,
 		log:     log,
 		srvConf: srvConf,
 		auth:    auth,
@@ -103,7 +106,7 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) handle(ctx context.Context, clientConn net.Conn) {
 	defer clientConn.Close()
 
-	sess := newSession(ctx, s.pool, s.cfg, s.cache, s.log.With("client", clientConn.RemoteAddr()))
+	sess := newSession(ctx, s.pool, s.cfg, s.cache, s.prof, s.log.With("client", clientConn.RemoteAddr()))
 	defer sess.close()
 
 	// Handshake: authenticates the client and, when it selects a database,

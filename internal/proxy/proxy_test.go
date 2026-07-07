@@ -127,7 +127,7 @@ func startPikoWith(t *testing.T, backendAddr string, opts pikoOpts) string {
 	ln.Close() // free the port for the server
 
 	users := []config.User{{Username: "wordpress", Password: "apppass"}}
-	srv := New(addr, users, poolCfg, p, opts.cache, log)
+	srv := New(addr, users, poolCfg, p, opts.cache, nil, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.Run(ctx) }()
