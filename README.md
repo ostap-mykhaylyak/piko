@@ -134,11 +134,12 @@ never cache per-user data (carts, sessions, anything keyed to a customer).
 ```sh
 make build   # binary in bin/piko
 make test    # unit tests
-make lint    # golangci-lint
 ```
 
-Releases are automated with [GoReleaser](https://goreleaser.com/): pushing a
-`v*` tag builds Linux binaries for amd64 and arm64.
+Every push to `main` runs the tests and builds Linux binaries (amd64 and
+arm64), downloadable as artifacts from the Actions run. Pushing a `v*` tag
+publishes them on the Releases page via
+[GoReleaser](https://goreleaser.com/), with checksums.
 
 ## License
 

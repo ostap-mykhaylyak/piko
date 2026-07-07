@@ -7,16 +7,13 @@ LDFLAGS = -s -w \
 	-X main.commit=$(COMMIT) \
 	-X main.date=$(DATE)
 
-.PHONY: build test lint run clean
+.PHONY: build test run clean
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/piko ./cmd/piko
 
 test:
 	go test -race ./...
-
-lint:
-	golangci-lint run
 
 run: build
 	./bin/piko -config config.yaml
