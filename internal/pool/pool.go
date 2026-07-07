@@ -29,6 +29,13 @@ type Dialer = client.Dialer
 type Conn struct {
 	*client.Conn
 
+	// BoundDB is the database the connection is currently bound to and
+	// VarSig identifies the session variables applied to it (see the proxy
+	// package). Both are maintained by the session layer to skip redundant
+	// COM_INIT_DB/SET roundtrips when connections hop between sessions.
+	BoundDB string
+	VarSig  string
+
 	pooledAt time.Time // when it was released to the pool
 	lastPing time.Time // last successful COM_PING or command
 }
@@ -48,9 +55,18 @@ type Pool struct {
 
 	resetUnsupported atomic.Bool
 
+	// Circuit breaker: after cfg.Breaker.Failures consecutive dial
+	// failures Acquire fails fast until a background probe reaches the
+	// backend again.
+	breakerFails atomic.Int32
+	breakerOpen  atomic.Bool
+
 	stop   chan struct{}
 	closed atomic.Bool
 }
+
+// ErrBackendDown is returned by Acquire while the circuit is open.
+var ErrBackendDown = errors.New("backend unavailable (circuit breaker open)")
 
 // New creates the pool and starts its keepalive loop.
 // A nil dialer means plain TCP.
@@ -76,6 +92,12 @@ func New(backend config.Backend, cfg config.Pool, log *slog.Logger, dialer Diale
 // otherwise a new one if the cap allows, otherwise it waits until a
 // connection frees up or the acquire timeout expires.
 func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
+	// Fail fast while the backend is down: without this, every PHP worker
+	// would pile up waiting for its own timeout.
+	if p.breakerOpen.Load() {
+		return nil, ErrBackendDown
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.AcquireTimeout)
 	defer cancel()
 
@@ -117,20 +139,37 @@ func (p *Pool) Release(c *Conn) {
 		p.Discard(c)
 		return
 	}
-	if err := p.reset(c); err != nil {
+	if err := p.ResetConn(c); err != nil {
 		p.log.Debug("closing backend connection, reset failed", "error", err)
 		p.Discard(c)
 		return
 	}
 
-	now := time.Now()
-	c.pooledAt = now
-	c.lastPing = now
-
 	if len(p.idle) >= p.cfg.MaxIdle {
 		p.Discard(c)
 		return
 	}
+	p.park(c)
+}
+
+// ReleaseClean parks a connection whose session state is known clean (the
+// multiplexing path releases between queries): no reset roundtrip, and no
+// MaxIdle trimming so bursts of concurrently released connections are not
+// closed just to be re-dialed a moment later — idle_timeout shrinks the
+// pool over time instead.
+func (p *Pool) ReleaseClean(c *Conn) {
+	if p.closed.Load() {
+		p.Discard(c)
+		return
+	}
+	p.park(c)
+}
+
+// park puts the connection in the idle buffer.
+func (p *Pool) park(c *Conn) {
+	now := time.Now()
+	c.pooledAt = now
+	c.lastPing = now
 	select {
 	case p.idle <- c:
 	default:
@@ -166,10 +205,60 @@ func (p *Pool) dial(ctx context.Context) (*Conn, error) {
 	c, err := client.ConnectWithDialer(ctx, "tcp", p.backend.Address,
 		p.backend.Username, p.backend.Password, "", p.dialer)
 	if err != nil {
+		p.recordDialFailure()
 		return nil, fmt.Errorf("connecting to backend %s: %w", p.backend.Address, err)
 	}
+	p.breakerFails.Store(0)
 	now := time.Now()
 	return &Conn{Conn: c, pooledAt: now, lastPing: now}, nil
+}
+
+// recordDialFailure counts consecutive dial failures and opens the circuit
+// when the configured threshold is reached.
+func (p *Pool) recordDialFailure() {
+	threshold := p.cfg.Breaker.Failures
+	if threshold <= 0 {
+		return
+	}
+	if p.breakerFails.Add(1) < int32(threshold) {
+		return
+	}
+	if p.breakerOpen.Swap(true) {
+		return // already open, probe running
+	}
+	p.log.Error("backend unreachable, circuit breaker open: failing fast",
+		"backend", p.backend.Address, "failures", threshold)
+	go p.probe()
+}
+
+// probe retries the backend until it answers, then closes the circuit.
+func (p *Pool) probe() {
+	ticker := time.NewTicker(p.cfg.Breaker.ProbeInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-ticker.C:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), p.cfg.Breaker.ProbeInterval)
+		c, err := client.ConnectWithDialer(ctx, "tcp", p.backend.Address,
+			p.backend.Username, p.backend.Password, "", p.dialer)
+		cancel()
+		if err != nil {
+			p.log.Debug("backend probe failed", "error", err)
+			continue
+		}
+		_ = c.Close()
+
+		p.breakerFails.Store(0)
+		p.breakerOpen.Store(false)
+		p.log.Info("backend recovered, circuit breaker closed",
+			"backend", p.backend.Address)
+		return
+	}
 }
 
 // revive validates a connection popped from the pool. Connections pinged
@@ -187,8 +276,28 @@ func (p *Pool) revive(c *Conn) bool {
 	return true
 }
 
-// reset clears session state with COM_RESET_CONNECTION. Servers that do not
-// support it (pre-5.7 MySQL) get a ROLLBACK as a best-effort fallback.
+// ResetConn clears session state with COM_RESET_CONNECTION: transactions
+// rolled back, locks and temp tables released, session variables back to
+// defaults. Servers that do not support it (pre-5.7 MySQL) get a ROLLBACK
+// as a best-effort fallback. The bindings are cleared conservatively.
+func (p *Pool) ResetConn(c *Conn) error {
+	if err := p.reset(c); err != nil {
+		return err
+	}
+	// The ROLLBACK fallback cannot clear session variables: a connection
+	// that had any applied is not safe to recycle.
+	if p.resetUnsupported.Load() && c.VarSig != "" {
+		return fmt.Errorf("backend lacks COM_RESET_CONNECTION, cannot clear session variables")
+	}
+	// Variables are gone for sure; the current database should survive a
+	// reset, but treating it as unknown costs at most one COM_INIT_DB later
+	// and removes any doubt.
+	c.VarSig = ""
+	c.BoundDB = ""
+	return nil
+}
+
+// reset sends COM_RESET_CONNECTION (or the ROLLBACK fallback).
 func (p *Pool) reset(c *Conn) error {
 	if p.resetUnsupported.Load() {
 		return c.Rollback()

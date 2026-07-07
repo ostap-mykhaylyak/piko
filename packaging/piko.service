@@ -1,0 +1,29 @@
+[Unit]
+Description=piko - MySQL proxy for WordPress and WooCommerce
+Documentation=https://github.com/ostap-mykhaylyak/piko
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=piko
+Group=piko
+ExecStart=/usr/bin/piko -config /etc/piko/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/log/piko
+
+[Install]
+WantedBy=multi-user.target

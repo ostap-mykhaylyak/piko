@@ -4,6 +4,9 @@
 listen:
   # Address WordPress connects to (DB_HOST in wp-config.php).
   address: "0.0.0.0:3306"
+  # Cap on concurrent client connections (0 = unlimited). Connections
+  # beyond the cap are refused immediately instead of piling up.
+  max_connections: 0
 
 backend:
   # The MySQL server piko forwards to. Backend connections belong to piko
@@ -34,6 +37,17 @@ pool:
   idle_timeout: 5m
   # How long a client waits for a connection when the pool is exhausted.
   acquire_timeout: 5s
+  # Release the backend connection between queries whenever the session
+  # state allows it: many PHP workers share few real MySQL connections.
+  # Sessions holding state (transactions, temp tables, locks, prepared
+  # statements, user variables) keep their connection automatically.
+  multiplexing: true
+  # Circuit breaker: after this many consecutive connection failures piko
+  # fails fast (no timeout pile-up) and probes the backend until it
+  # recovers. failures: 0 disables it.
+  breaker:
+    failures: 3
+    probe_interval: 2s
 
 cache:
   # WordPress-aware in-memory query cache with write-driven invalidation.
@@ -53,8 +67,12 @@ cache:
   max_entries: 10000
   max_result_bytes: 1048576   # skip caching results larger than this (1 MiB)
   # Directory with extra cache rules, e.g. the WooCommerce profile.
-  # Default: the conf.d directory next to this file.
+  # Default: the conf.d directory next to this file. Reload rules without
+  # restarting: systemctl reload piko (SIGHUP).
   # rules_dir: /etc/piko/conf.d
+  # Re-populate the autoloaded options snapshot in the background right
+  # after an option write invalidates it, so the next pageload finds it hot.
+  warmup: true
 
 profiling:
   # Query profiling: statistics, slow query log and index suggestions,

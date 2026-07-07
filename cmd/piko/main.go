@@ -113,7 +113,7 @@ func run(configPath string) error {
 	if rulesDir == "" {
 		rulesDir = filepath.Join(filepath.Dir(configPath), "conf.d")
 	}
-	cacheRules, rewriteRules, err := cache.LoadRuleDir(rulesDir)
+	cacheRules, rewriteRules, err := cache.LoadRuleDir(rulesDir, cfg.Cache.TablePrefix)
 	if err != nil {
 		return err
 	}
@@ -125,20 +125,31 @@ func run(configPath string) error {
 			"table_prefix", cfg.Cache.TablePrefix, "rules", len(cacheRules), "rules_dir", rulesDir)
 	}
 
-	var rw *rewrite.Rewriter
-	if len(rewriteRules) > 0 {
-		if rw, err = rewrite.New(rewriteRules, log); err != nil {
-			return err
-		}
+	// The rewriter always exists (possibly with zero rules) so a hot
+	// reload can bring rules in later.
+	rw, err := rewrite.New(rewriteRules, log)
+	if err != nil {
+		return err
+	}
+	if rw.Len() > 0 {
 		log.Info("query rewriting enabled", "rules", rw.Len(), "rules_dir", rulesDir)
 	}
 
 	backendPool := pool.New(cfg.Backend, cfg.Pool, log, nil)
 	defer backendPool.Close()
 
+	if qc != nil && cfg.Cache.Warmup {
+		warmer := cache.NewWarmer(qc, backendPool, log)
+		go warmer.Run(ctx)
+		qc.SetRefetch(warmer.Trigger)
+	}
+
 	var prof *profile.Profiler
 	if cfg.Profiling.Enabled {
 		prof = profile.New(cfg.Profiling, backendPool, log)
+		if qc != nil {
+			prof.SetCache(qc)
+		}
 		go prof.Run(ctx)
 		log.Info("profiling enabled",
 			"slow_query", cfg.Profiling.SlowQuery,
@@ -146,8 +157,36 @@ func run(configPath string) error {
 			"suggest_indexes", cfg.Profiling.SuggestIndexes)
 	}
 
+	// Hot reload: SIGHUP re-reads the conf.d drop-ins (cache rules and
+	// rewrites) without touching client sessions.
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reload:
+			}
+			newRules, newRewrites, err := cache.LoadRuleDir(rulesDir, cfg.Cache.TablePrefix)
+			if err != nil {
+				log.Error("rules reload failed, keeping the previous rules", "error", err)
+				continue
+			}
+			if err := rw.SetRules(newRewrites); err != nil {
+				log.Error("rewrites reload failed, keeping the previous rules", "error", err)
+				continue
+			}
+			if qc != nil {
+				qc.SetRules(newRules)
+			}
+			log.Info("rules reloaded",
+				"cache_rules", len(newRules), "rewrites", len(newRewrites), "rules_dir", rulesDir)
+		}
+	}()
+
 	srv := proxy.New(proxy.Options{
-		Addr:     cfg.Listen.Address,
+		Listen:   cfg.Listen,
 		Users:    cfg.Users,
 		PoolCfg:  cfg.Pool,
 		Pool:     backendPool,

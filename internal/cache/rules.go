@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -35,9 +36,11 @@ type ruleFile struct {
 }
 
 // LoadRuleDir loads and compiles every *.yaml/*.yml file in dir, in
-// lexical order. A missing directory is not an error: it just means no
+// lexical order. The literal placeholder {prefix} in patterns and table
+// lists expands to tablePrefix, so shipped rules work with any WordPress
+// $table_prefix. A missing directory is not an error: it just means no
 // extra rules.
-func LoadRuleDir(dir string) ([]Rule, []rewrite.Rule, error) {
+func LoadRuleDir(dir, tablePrefix string) ([]Rule, []rewrite.Rule, error) {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil, nil, nil
@@ -62,7 +65,7 @@ func LoadRuleDir(dir string) ([]Rule, []rewrite.Rule, error) {
 	var rewrites []rewrite.Rule
 	for _, name := range files {
 		path := filepath.Join(dir, name)
-		f, err := loadRuleFile(path)
+		f, err := loadRuleFile(path, tablePrefix)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -72,7 +75,7 @@ func LoadRuleDir(dir string) ([]Rule, []rewrite.Rule, error) {
 	return rules, rewrites, nil
 }
 
-func loadRuleFile(path string) (*ruleFile, error) {
+func loadRuleFile(path, tablePrefix string) (*ruleFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
@@ -85,8 +88,13 @@ func loadRuleFile(path string) (*ruleFile, error) {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
 
+	expand := func(s string) string { return strings.ReplaceAll(s, "{prefix}", tablePrefix) }
 	for i := range f.Rules {
 		r := &f.Rules[i]
+		r.Match = expand(r.Match)
+		for j := range r.InvalidateOn {
+			r.InvalidateOn[j] = expand(r.InvalidateOn[j])
+		}
 		if r.Match == "" {
 			return nil, fmt.Errorf("%s: rules[%d] (%s): match is required", path, i, r.Name)
 		}
@@ -100,6 +108,8 @@ func loadRuleFile(path string) (*ruleFile, error) {
 		r.re = re
 	}
 	for i := range f.Rewrites {
+		f.Rewrites[i].Match = expand(f.Rewrites[i].Match)
+		f.Rewrites[i].Replace = expand(f.Rewrites[i].Replace)
 		if err := f.Rewrites[i].Compile(); err != nil {
 			return nil, fmt.Errorf("%s: rewrites[%d]: %w", path, i, err)
 		}

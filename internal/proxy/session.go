@@ -23,16 +23,26 @@ import (
 // flushed on commit instead.
 const maxTrackedTxWrites = 128
 
+// maxTrackedSets caps the SET statements replayed on connection reuse;
+// sessions setting more than this get pinned instead.
+const maxTrackedSets = 20
+
 // session implements server.Handler for one client connection.
 //
-// A backend connection is acquired lazily (or at handshake time when the
-// client selects a database) and stays attached for the whole client session
-// so transactions and session state behave exactly as with a direct
-// connection. While the client is idle — e.g. PHP parsing a large CSV before
-// an INSERT — a pinger goroutine keeps the attached backend connection alive
-// with COM_PING so MySQL never drops it ("server has gone away"). If the
-// backend connection is lost anyway, the next command transparently attaches
-// a fresh one from the pool.
+// With multiplexing enabled (the default), the backend connection is
+// returned to the pool after every statement that leaves no session state
+// behind, so many client sessions share few backend connections. Sessions
+// holding state — open transactions, temporary tables, locks, prepared
+// statements, user variables — keep their connection attached (pinned)
+// exactly like a direct connection would behave. Tracked SET statements
+// (SET NAMES and friends) are replayed when the session lands on a
+// different connection.
+//
+// While a client idles holding an attached connection — e.g. PHP parsing a
+// large CSV in the middle of a transaction — a pinger goroutine keeps that
+// connection alive with COM_PING so MySQL never drops it ("server has gone
+// away"). If the backend connection is lost anyway, the next command
+// transparently attaches a fresh one from the pool.
 type session struct {
 	ctx      context.Context
 	pool     *pool.Pool
@@ -53,6 +63,14 @@ type session struct {
 	txOverflow  bool
 	cacheUnsafe bool // session did something piko cannot track (autocommit...)
 
+	// Multiplexing state (guarded by mu as well).
+	mux       bool     // per-query release enabled
+	pinned    bool     // session permanently tied to its connection
+	holdNext  bool     // keep the connection for one more statement
+	openStmts int      // prepared statements alive on the connection
+	setStmts  []string // tracked SETs replayed on connection reuse
+	varSig    string   // signature of setStmts
+
 	stopPing chan struct{}
 	pingDone chan struct{}
 }
@@ -66,6 +84,7 @@ func newSession(ctx context.Context, srv *Server, log *slog.Logger) *session {
 		prof:     srv.prof,
 		rewriter: srv.rewriter,
 		log:      log,
+		mux:      srv.cfg.Multiplexing,
 		lastUse:  time.Now(),
 		stopPing: make(chan struct{}),
 		pingDone: make(chan struct{}),
@@ -87,28 +106,157 @@ func (s *session) close() {
 	}
 }
 
-// backend returns the attached connection, acquiring one if needed.
-// Must be called with s.mu held.
+// backend returns the attached connection, acquiring and preparing one if
+// needed. Must be called with s.mu held.
 func (s *session) backend() (*pool.Conn, error) {
 	if s.conn != nil {
 		return s.conn, nil
 	}
 
-	c, err := s.pool.Acquire(s.ctx)
-	if err != nil {
-		return nil, err
-	}
-	// Bind the connection to the client's database. Always done on a fresh
-	// attach: a pooled connection may carry the database of a previous
-	// session.
-	if s.db != "" {
-		if err := c.UseDB(s.db); err != nil {
-			s.discardOrRelease(c, err)
+	// One retry: a pooled connection can fail preparation for connection
+	// reasons (died while parked); a freshly dialed one gets a second shot.
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		c, err := s.pool.Acquire(s.ctx)
+		if err != nil {
 			return nil, err
 		}
+		if err := s.prepareConn(c); err != nil {
+			lastErr = err
+			if isConnError(err) {
+				s.pool.Discard(c)
+				continue
+			}
+			// MySQL-level error (e.g. unknown database): the connection is
+			// fine, the request is not.
+			s.pool.Release(c)
+			return nil, err
+		}
+		s.conn = c
+		return c, nil
 	}
-	s.conn = c
-	return c, nil
+	return nil, lastErr
+}
+
+// prepareConn aligns a pooled connection with this session's environment:
+// clears foreign session variables, binds the database and replays the
+// session's tracked SETs. In the steady state (every WordPress session
+// issues the same SET NAMES) signatures match and no roundtrip happens.
+// Must be called with s.mu held.
+func (s *session) prepareConn(c *pool.Conn) error {
+	if c.VarSig != s.varSig && c.VarSig != "" {
+		// The connection carries another session's variables.
+		if err := s.pool.ResetConn(c); err != nil {
+			return err
+		}
+	}
+	if s.db != "" && c.BoundDB != s.db {
+		if err := c.UseDB(s.db); err != nil {
+			return err
+		}
+		c.BoundDB = s.db
+	}
+	if c.VarSig != s.varSig {
+		for _, stmt := range s.setStmts {
+			if _, err := c.Execute(stmt); err != nil {
+				return err
+			}
+		}
+		c.VarSig = s.varSig
+	}
+	return nil
+}
+
+// maybeRelease returns the connection to the pool when the session state
+// allows it. Must be called with s.mu held, after the statement's result
+// has been fully read (results are buffered, so the client reply does not
+// need the connection anymore).
+func (s *session) maybeRelease() {
+	if !s.mux || s.conn == nil {
+		return
+	}
+	if s.pinned || s.inTx || s.openStmts > 0 {
+		return
+	}
+	// Status flags from the last OK/EOF packet: catches implicit
+	// transactions (autocommit=0) even if keyword tracking missed them.
+	if s.conn.IsInTransaction() || !s.conn.IsAutoCommit() {
+		return
+	}
+	if s.holdNext {
+		s.holdNext = false
+		return
+	}
+	c := s.conn
+	s.conn = nil
+	s.pool.ReleaseClean(c)
+}
+
+// pin ties the session to its connection for its whole lifetime.
+// Must be called with s.mu held.
+func (s *session) pin(reason string) {
+	if s.pinned {
+		return
+	}
+	s.pinned = true
+	s.log.Debug("session pinned to its backend connection", "reason", reason)
+}
+
+// trackSafety updates transaction/pinning state after every successful
+// statement, independent of the cache. Must be called with s.mu held.
+func (s *session) trackSafety(kind cache.Kind, query string, r *mysql.Result) {
+	switch kind {
+	case cache.KindBegin:
+		s.inTx = true
+	case cache.KindCommit, cache.KindRollback:
+		s.inTx = false
+	case cache.KindUnsafe:
+		s.pin("untracked session command (autocommit/XA)")
+	}
+	if r != nil && r.Status&mysql.SERVER_STATUS_IN_TRANS != 0 {
+		s.inTx = true
+	}
+
+	if pinDetectRe.MatchString(query) {
+		s.pin("temporary table, lock or transaction setting")
+	}
+	// User variables persist on the connection with values piko cannot
+	// reproduce. Checked on the fingerprint so literals ('a@b.com') do not
+	// false-positive.
+	if strings.Contains(query, "@") && userVarRe.MatchString(profile.Fingerprint(query)) {
+		s.pin("user-defined variables")
+	}
+
+	// The companion statement (SELECT FOUND_ROWS(), SELECT
+	// LAST_INSERT_ID()...) must run on this same connection.
+	if holdDetectRe.MatchString(query) || (r != nil && r.InsertId > 0) {
+		s.holdNext = true
+	}
+}
+
+// trackSet handles a successful SET statement: replayable ones join the
+// session environment, untrackable ones pin. Must be called with s.mu held.
+func (s *session) trackSet(query string, act setAction) {
+	switch act {
+	case setTrack:
+		for _, existing := range s.setStmts {
+			if existing == query {
+				return // repeated identical SET (wpdb re-sends SET NAMES)
+			}
+		}
+		if len(s.setStmts) >= maxTrackedSets {
+			s.pin("too many session settings to replay")
+			return
+		}
+		s.setStmts = append(s.setStmts, query)
+		s.varSig = varSignature(s.setStmts)
+		if s.conn != nil {
+			s.conn.VarSig = s.varSig
+		}
+	case setPin:
+		s.pin("untrackable SET statement")
+	case setNone, setIgnore:
+	}
 }
 
 // finish records activity and handles connection-level failures: on a
@@ -180,12 +328,20 @@ func (s *session) UseDB(dbName string) error {
 
 	s.db = dbName
 	if s.conn == nil {
-		// backend() binds the database on a fresh attach.
-		_, err := s.backend()
-		return err
+		// backend() binds the database on a fresh attach; attaching eagerly
+		// also validates the database name during the handshake.
+		if _, err := s.backend(); err != nil {
+			return err
+		}
+		s.maybeRelease()
+		return nil
 	}
 	err := s.conn.UseDB(dbName)
 	s.finish(err)
+	if err == nil && s.conn != nil {
+		s.conn.BoundDB = dbName
+		s.maybeRelease()
+	}
 	return err
 }
 
@@ -201,17 +357,18 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 		}
 	}
 
-	kind := cache.KindOther
-	if s.cacheActive() {
-		kind = cache.Classify(query)
-		// Inside a transaction reads must see the session's own writes,
-		// so the cache is bypassed entirely.
-		if kind == cache.KindSelect && !s.inTx {
-			if r, ok := s.cache.Lookup(s.db, query); ok {
-				s.lastUse = time.Now()
-				s.profile(query, 0, r, true, nil)
-				return r, nil
-			}
+	kind := cache.Classify(query)
+
+	// Inside a transaction reads must see the session's own writes,
+	// so the cache is bypassed entirely.
+	if s.cacheActive() && kind == cache.KindSelect && !s.inTx {
+		if r, ok := s.cache.Lookup(s.db, query); ok {
+			s.lastUse = time.Now()
+			s.profile(query, 0, r, true, nil)
+			// Served from memory: an attached clean connection is not
+			// needed for this session right now.
+			s.maybeRelease()
+			return r, nil
 		}
 	}
 
@@ -227,9 +384,12 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 		return r, err
 	}
 
+	s.trackSet(query, classifySet(query))
+	s.trackSafety(kind, query, r)
 	if s.cacheActive() {
 		s.observe(kind, query, r)
 	}
+	s.maybeRelease()
 	return r, nil
 }
 
@@ -319,10 +479,15 @@ func (s *session) HandleFieldList(table string, fieldWildcard string) ([]*mysql.
 	}
 	fields, err := c.FieldList(table, fieldWildcard)
 	s.finish(err)
+	if err == nil {
+		s.maybeRelease()
+	}
 	return fields, err
 }
 
 // HandleStmtPrepare handles COM_STMT_PREPARE by preparing on the backend.
+// Statement handles live on one specific connection: the session keeps it
+// attached until every statement is closed.
 func (s *session) HandleStmtPrepare(query string) (int, int, any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -336,6 +501,7 @@ func (s *session) HandleStmtPrepare(query string) (int, int, any, error) {
 	if err != nil {
 		return 0, 0, nil, err
 	}
+	s.openStmts++
 	return stmt.ParamNum(), stmt.ColumnNum(), stmt, nil
 }
 
@@ -353,10 +519,12 @@ func (s *session) HandleStmtExecute(context any, query string, args []any) (*mys
 	r, err := stmt.Execute(args...)
 	s.finish(err)
 	s.profile(query, time.Since(start), r, false, err)
-	if err == nil && s.cacheActive() {
-		// Prepared reads are never cached, but prepared writes still have
-		// to invalidate what they touch.
-		if kind := cache.Classify(query); kind != cache.KindSelect {
+	if err == nil {
+		kind := cache.Classify(query)
+		s.trackSafety(kind, query, r)
+		if s.cacheActive() && kind != cache.KindSelect {
+			// Prepared reads are never cached, but prepared writes still
+			// have to invalidate what they touch.
 			s.observe(kind, query, r)
 		}
 	}
@@ -375,6 +543,12 @@ func (s *session) HandleStmtClose(context any) error {
 
 	err := stmt.Close()
 	s.finish(err)
+	if s.openStmts > 0 {
+		s.openStmts--
+	}
+	if err == nil {
+		s.maybeRelease()
+	}
 	return err
 }
 

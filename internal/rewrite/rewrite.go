@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sync/atomic"
 )
 
 // Rule replaces every match of a regex in the query text. Replace supports
@@ -35,28 +36,40 @@ func (r *Rule) Compile() error {
 	return nil
 }
 
-// Rewriter applies an ordered list of rules to query text.
+// Rewriter applies an ordered list of rules to query text. The rule set is
+// swappable at runtime (hot reload) without touching active sessions.
 type Rewriter struct {
-	rules []Rule
+	rules atomic.Pointer[[]Rule]
 	log   *slog.Logger
 }
 
 // New compiles any uncompiled rules and builds the rewriter.
 func New(rules []Rule, log *slog.Logger) (*Rewriter, error) {
+	rw := &Rewriter{log: log}
+	if err := rw.SetRules(rules); err != nil {
+		return nil, err
+	}
+	return rw, nil
+}
+
+// SetRules atomically replaces the rule set; used by hot reload.
+func (rw *Rewriter) SetRules(rules []Rule) error {
 	for i := range rules {
 		if err := rules[i].Compile(); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return &Rewriter{rules: rules, log: log}, nil
+	rw.rules.Store(&rules)
+	return nil
 }
 
 // Apply runs every rule in order and returns the resulting query plus the
 // names of the rules that fired.
 func (rw *Rewriter) Apply(query string) (string, []string) {
+	rules := *rw.rules.Load()
 	var applied []string
-	for i := range rw.rules {
-		r := &rw.rules[i]
+	for i := range rules {
+		r := &rules[i]
 		if !r.re.MatchString(query) {
 			continue
 		}
@@ -67,4 +80,4 @@ func (rw *Rewriter) Apply(query string) (string, []string) {
 }
 
 // Len returns the number of loaded rules.
-func (rw *Rewriter) Len() int { return len(rw.rules) }
+func (rw *Rewriter) Len() int { return len(*rw.rules.Load()) }

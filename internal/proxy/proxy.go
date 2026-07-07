@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
@@ -25,7 +26,7 @@ import (
 // Options wires the Server's collaborators; Cache, Profiler and Rewriter
 // are optional.
 type Options struct {
-	Addr     string
+	Listen   config.Listen
 	Users    []config.User
 	PoolCfg  config.Pool
 	Pool     *pool.Pool
@@ -37,19 +38,21 @@ type Options struct {
 
 // Server accepts client connections and serves the MySQL protocol.
 type Server struct {
-	addr     string
-	pool     *pool.Pool
-	cfg      config.Pool
-	cache    *cache.Cache      // nil when disabled
-	prof     *profile.Profiler // nil when disabled
-	rewriter *rewrite.Rewriter // nil when disabled
-	log      *slog.Logger
+	addr       string
+	maxClients int
+	pool       *pool.Pool
+	cfg        config.Pool
+	cache      *cache.Cache      // nil when disabled
+	prof       *profile.Profiler // nil when disabled
+	rewriter   *rewrite.Rewriter // nil when disabled
+	log        *slog.Logger
 
 	srvConf *server.Server
 	auth    *server.InMemoryAuthenticationHandler
 
-	wg      sync.WaitGroup
-	clients sync.Map // net.Conn -> struct{}, open client sockets
+	wg         sync.WaitGroup
+	clients    sync.Map // net.Conn -> struct{}, open client sockets
+	numClients atomic.Int64
 }
 
 // New creates a Server; call Run to start serving.
@@ -65,15 +68,16 @@ func New(o Options) *Server {
 	}
 
 	return &Server{
-		addr:     o.Addr,
-		pool:     o.Pool,
-		cfg:      o.PoolCfg,
-		cache:    o.Cache,
-		prof:     o.Profiler,
-		rewriter: o.Rewriter,
-		log:      o.Log,
-		srvConf:  srvConf,
-		auth:     auth,
+		addr:       o.Listen.Address,
+		maxClients: o.Listen.MaxConnections,
+		pool:       o.Pool,
+		cfg:        o.PoolCfg,
+		cache:      o.Cache,
+		prof:       o.Profiler,
+		rewriter:   o.Rewriter,
+		log:        o.Log,
+		srvConf:    srvConf,
+		auth:       auth,
 	}
 }
 
@@ -106,10 +110,19 @@ func (s *Server) Run(ctx context.Context) error {
 			continue
 		}
 
+		if s.maxClients > 0 && s.numClients.Load() >= int64(s.maxClients) {
+			s.log.Warn("client connection limit reached, rejecting",
+				"client", conn.RemoteAddr(), "max_connections", s.maxClients)
+			_ = conn.Close()
+			continue
+		}
+
+		s.numClients.Add(1)
 		s.clients.Store(conn, struct{}{})
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.numClients.Add(-1)
 			defer s.clients.Delete(conn)
 			s.handle(ctx, conn)
 		}()

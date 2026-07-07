@@ -206,7 +206,7 @@ rules:
 		t.Fatal(err)
 	}
 
-	rules, rewrites, err := LoadRuleDir(dir)
+	rules, rewrites, err := LoadRuleDir(dir, "wp_")
 	if err != nil {
 		t.Fatalf("LoadRuleDir: %v", err)
 	}
@@ -227,12 +227,12 @@ rewrites:
 	if err := os.WriteFile(filepath.Join(dir, "15-rw.yaml"), []byte(withRewrites), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, rewrites, err = LoadRuleDir(dir); err != nil || len(rewrites) != 1 {
+	if _, rewrites, err = LoadRuleDir(dir, "wp_"); err != nil || len(rewrites) != 1 {
 		t.Fatalf("rewrites = %+v (err %v), want 1", rewrites, err)
 	}
 
 	// Missing directory is fine.
-	if rules, _, err := LoadRuleDir(filepath.Join(dir, "missing")); err != nil || rules != nil {
+	if rules, _, err := LoadRuleDir(filepath.Join(dir, "missing"), "wp_"); err != nil || rules != nil {
 		t.Fatalf("missing dir: rules=%v err=%v", rules, err)
 	}
 
@@ -241,8 +241,99 @@ rewrites:
 	if err := os.WriteFile(filepath.Join(dir, "20-bad.yaml"), []byte(bad), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := LoadRuleDir(dir); err == nil {
+	if _, _, err := LoadRuleDir(dir, "wp_"); err == nil {
 		t.Fatal("expected error for invalid regex")
+	}
+}
+
+// TestPrefixPlaceholder: {prefix} expands to the configured table prefix in
+// rule patterns, invalidation tables and rewrites.
+func TestPrefixPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	content := `
+rules:
+  - name: meta
+    match: "^SELECT \\* FROM {prefix}postmeta$"
+    ttl: 30s
+    invalidate_on: ["{prefix}postmeta"]
+rewrites:
+  - name: rw
+    match: "FROM {prefix}big"
+    replace: "FROM {prefix}small"
+`
+	if err := os.WriteFile(filepath.Join(dir, "p.yaml"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rules, rewrites, err := LoadRuleDir(dir, "shop_")
+	if err != nil {
+		t.Fatalf("LoadRuleDir: %v", err)
+	}
+	if rules[0].Match != `^SELECT \* FROM shop_postmeta$` {
+		t.Errorf("match = %q", rules[0].Match)
+	}
+	if rules[0].InvalidateOn[0] != "shop_postmeta" {
+		t.Errorf("invalidate_on = %v", rules[0].InvalidateOn)
+	}
+	if rewrites[0].Match != "FROM shop_big" || rewrites[0].Replace != "FROM shop_small" {
+		t.Errorf("rewrite = %+v", rewrites[0])
+	}
+}
+
+// TestSetRulesReload: swapping rules at runtime flushes the cache and the
+// new rules take effect.
+func TestSetRulesReload(t *testing.T) {
+	c := testCache(t, nil)
+	c.Store("wp", autoloadQ, testResult(t))
+
+	q := "SELECT post_id, meta_key, meta_value FROM wp_postmeta WHERE post_id IN (1) ORDER BY meta_id ASC"
+	c.Store("wp", q, testResult(t))
+	if _, ok := c.Lookup("wp", q); ok {
+		t.Fatal("query cached without any matching rule")
+	}
+
+	rule := Rule{Name: "postmeta", Match: `(?i)^SELECT post_id, meta_key, meta_value FROM wp_postmeta`,
+		TTL: time.Minute, InvalidateOn: []string{"wp_postmeta"}}
+	rule.re = mustCompile(t, rule.Match)
+	c.SetRules([]Rule{rule})
+
+	// Reload flushed everything.
+	if _, ok := c.Lookup("wp", autoloadQ); ok {
+		t.Fatal("expected the cache to be flushed on rules reload")
+	}
+	// The new rule is live.
+	c.Store("wp", q, testResult(t))
+	if _, ok := c.Lookup("wp", q); !ok {
+		t.Fatal("expected the reloaded rule to cache the query")
+	}
+}
+
+// TestReportStats: per-source counters follow stores, hits and evictions.
+func TestReportStats(t *testing.T) {
+	c := testCache(t, nil)
+	c.Store("wp", autoloadQ, testResult(t))
+	c.Store("wp", transientQ, testResult(t))
+	c.Lookup("wp", autoloadQ)
+	c.Lookup("wp", autoloadQ)
+	c.Lookup("wp", transientQ)
+	c.Lookup("wp", "SELECT missing")
+
+	rep := c.ReportStats()
+	if rep.Hits != 3 || rep.Misses != 1 || rep.Entries != 2 || rep.Bytes <= 0 {
+		t.Fatalf("report = %+v", rep)
+	}
+	if src := rep.Sources["alloptions"]; src.Hits != 2 || src.Entries != 1 {
+		t.Fatalf("alloptions source = %+v", src)
+	}
+	if src := rep.Sources["transients"]; src.Hits != 1 || src.Entries != 1 {
+		t.Fatalf("transients source = %+v", src)
+	}
+
+	// Invalidation updates the per-source entry counters.
+	c.InvalidateWrite("wp", "UPDATE wp_options SET option_value = 'x' WHERE option_name = 'blogname'")
+	rep = c.ReportStats()
+	if src := rep.Sources["alloptions"]; src.Entries != 0 {
+		t.Fatalf("alloptions entries after invalidation = %d, want 0", src.Entries)
 	}
 }
 

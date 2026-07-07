@@ -12,6 +12,18 @@ configured with a single `config.yaml`.
   (`COM_RESET_CONNECTION`) and parked for the next client instead of being
   closed: hundreds of short-lived PHP requests share a handful of real MySQL
   connections.
+- **Per-query multiplexing** — with `pool.multiplexing: true` (default) the
+  backend connection is returned to the pool **between queries**, not just
+  between sessions: hundreds of concurrent PHP-FPM workers share a few dozen
+  real MySQL connections. Safety is automatic — sessions holding state are
+  pinned to their connection: open transactions (tracked by keyword *and* by
+  the server status flags, so `autocommit=0` is caught too), temporary
+  tables, `LOCK TABLES`/`GET_LOCK()`, prepared statements, user-defined
+  variables. Session settings like `SET NAMES` don't pin: piko tracks them
+  and replays them when the session lands on a different connection (in the
+  steady state every WordPress session issues the same `SET NAMES`, so no
+  extra roundtrip happens). After `SQL_CALC_FOUND_ROWS`, `LAST_INSERT_ID()`
+  or an INSERT, the connection is held for the companion statement.
 - **Keepalive pings** — idle connections receive periodic `COM_PING`s, both
   while parked in the pool and while attached to an inactive client. A PHP
   worker that holds its connection during a long computation (importing a CSV,
@@ -34,9 +46,35 @@ configured with a single `config.yaml`.
   `/etc/piko/conf.d/` add cache rules as regex + TTL + invalidation tables.
   `piko --init` installs a WooCommerce profile covering the product-data
   queries that hammer shops (postmeta lookups, attribute taxonomies, term
-  lookups). Carts and customer sessions are deliberately never cached.
+  lookups). The `{prefix}` placeholder expands to `cache.table_prefix`, so
+  rules work with any `$table_prefix`. Carts and customer sessions are
+  deliberately never cached.
+- **Hot reload** — `SIGHUP` (or `systemctl reload piko`) re-reads the
+  conf.d drop-ins (cache rules and rewrites) without dropping a single
+  client connection. A failed reload keeps the previous rules.
+- **Cache warm-up** — every option write invalidates the autoloaded options
+  snapshot; with `cache.warmup` enabled piko re-fetches it in the background
+  immediately, so the next visitor never pays the query.
+- **Circuit breaker** — when MySQL is down, waiting for per-request timeouts
+  melts PHP-FPM. After `pool.breaker.failures` consecutive connection
+  failures piko fails fast with a clean error and probes the backend until
+  it recovers. `listen.max_connections` additionally caps concurrent client
+  connections.
 
 ## Quick start
+
+On Ubuntu, install the `.deb` from the Releases page — it ships the binary,
+a hardened systemd unit, logrotate configuration, a dedicated `piko` user
+and the default configuration:
+
+```sh
+sudo dpkg -i piko_*_amd64.deb
+sudo $EDITOR /etc/piko/config.yaml
+sudo systemctl enable --now piko
+sudo systemctl reload piko            # SIGHUP: hot-reloads conf.d rules
+```
+
+Or run the plain binary:
 
 ```sh
 sudo ./piko --init                    # creates /etc/piko/config.yaml
@@ -75,6 +113,7 @@ pool:
   ping_interval: 30s
   idle_timeout: 5m
   acquire_timeout: 5s
+  multiplexing: true
 
 cache:
   enabled: true
@@ -200,8 +239,10 @@ make test    # unit tests
 
 Every push to `main` runs the tests and builds Linux binaries (amd64 and
 arm64), downloadable as artifacts from the Actions run. Pushing a `v*` tag
-publishes them on the Releases page via
-[GoReleaser](https://goreleaser.com/), with checksums.
+publishes binaries and Ubuntu/Debian `.deb` packages on the Releases page
+via [GoReleaser](https://goreleaser.com/), with checksums. The systemd
+unit, logrotate config and post-install script live in
+[packaging/](packaging/).
 
 ## License
 

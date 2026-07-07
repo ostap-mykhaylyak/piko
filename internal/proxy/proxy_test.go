@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +25,27 @@ type fakeCounters struct {
 	accepted  atomic.Int64
 	queries   atomic.Int64
 	lastQuery atomic.Value // string
+
+	mu       sync.Mutex
+	queryLog []string
+}
+
+func (c *fakeCounters) record(query string) {
+	c.mu.Lock()
+	c.queryLog = append(c.queryLog, query)
+	c.mu.Unlock()
+}
+
+func (c *fakeCounters) countQueries(substr string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, q := range c.queryLog {
+		if strings.Contains(q, substr) {
+			n++
+		}
+	}
+	return n
 }
 
 // fakeHandler answers every SELECT with a single-value resultset, every
@@ -35,6 +57,7 @@ func (fakeHandler) UseDB(string) error { return nil }
 func (h fakeHandler) HandleQuery(query string) (*mysql.Result, error) {
 	h.counters.queries.Add(1)
 	h.counters.lastQuery.Store(query)
+	h.counters.record(query)
 	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "SELECT") {
 		return &mysql.Result{AffectedRows: 1}, nil
 	}
@@ -81,6 +104,8 @@ func startFakeMySQL(t *testing.T, user, password string) (string, *fakeCounters)
 				if err != nil {
 					return
 				}
+				// Real MySQL advertises autocommit in its status flags.
+				conn.SetStatus(mysql.SERVER_STATUS_AUTOCOMMIT)
 				for !conn.Closed() {
 					if conn.HandleCommand() != nil {
 						return
@@ -98,6 +123,7 @@ type pikoOpts struct {
 	dialer       pool.Dialer
 	cache        *cache.Cache
 	rewriter     *rewrite.Rewriter
+	maxClients   int
 }
 
 // startPiko runs the full stack (pool + proxy) against the fake backend.
@@ -117,6 +143,7 @@ func startPikoWith(t *testing.T, backendAddr string, opts pikoOpts) string {
 		MaxIdle:        4,
 		PingInterval:   opts.pingInterval,
 		AcquireTimeout: 2 * time.Second,
+		Multiplexing:   true,
 	}
 	p := pool.New(config.Backend{
 		Address: backendAddr, Username: "piko", Password: "backendpass",
@@ -132,7 +159,7 @@ func startPikoWith(t *testing.T, backendAddr string, opts pikoOpts) string {
 
 	users := []config.User{{Username: "wordpress", Password: "apppass"}}
 	srv := New(Options{
-		Addr:     addr,
+		Listen:   config.Listen{Address: addr, MaxConnections: opts.maxClients},
 		Users:    users,
 		PoolCfg:  poolCfg,
 		Pool:     p,
@@ -242,6 +269,159 @@ func TestIdleSessionKeepalive(t *testing.T) {
 	}
 }
 
+// TestMultiplexingSharesConnections: two concurrently open client sessions
+// alternating clean queries must share one backend connection.
+func TestMultiplexingSharesConnections(t *testing.T) {
+	backendAddr, counters := startFakeMySQL(t, "piko", "backendpass")
+	pikoAddr := startPiko(t, backendAddr)
+
+	a, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	for i := 0; i < 5; i++ {
+		if _, err := a.Execute("SELECT 42"); err != nil {
+			t.Fatalf("client A round %d: %v", i, err)
+		}
+		if _, err := b.Execute("SELECT 42"); err != nil {
+			t.Fatalf("client B round %d: %v", i, err)
+		}
+	}
+
+	if got := counters.accepted.Load(); got != 1 {
+		t.Errorf("backend saw %d connections for 2 multiplexed sessions, want 1", got)
+	}
+}
+
+// TestTransactionPinsConnection: a session inside a transaction keeps its
+// connection; other sessions get their own.
+func TestTransactionPinsConnection(t *testing.T) {
+	backendAddr, counters := startFakeMySQL(t, "piko", "backendpass")
+	pikoAddr := startPiko(t, backendAddr)
+
+	a, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	if _, err := a.Execute("START TRANSACTION"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Execute("SELECT 42"); err != nil {
+		t.Fatal(err)
+	}
+
+	// B arrives while A holds its transaction: needs a second connection.
+	b, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := b.Execute("SELECT 42"); err != nil {
+		t.Fatal(err)
+	}
+	if got := counters.accepted.Load(); got != 2 {
+		t.Errorf("backend saw %d connections with a pinned transaction, want 2", got)
+	}
+
+	// After COMMIT the connection is shareable again.
+	if _, err := a.Execute("COMMIT"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := a.Execute("SELECT 42"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Execute("SELECT 42"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := counters.accepted.Load(); got != 2 {
+		t.Errorf("backend saw %d connections after commit, want still 2", got)
+	}
+}
+
+// TestSetNamesReplay: tracked SET statements follow the session onto other
+// connections instead of pinning it.
+func TestSetNamesReplay(t *testing.T) {
+	backendAddr, counters := startFakeMySQL(t, "piko", "backendpass")
+	pikoAddr := startPiko(t, backendAddr)
+
+	a, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	// A configures its charset, like wpdb does at connect.
+	if _, err := a.Execute("SET NAMES utf8mb4"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Execute("SELECT 42"); err != nil {
+		t.Fatal(err)
+	}
+	// B (no SETs) grabs the shared connection: piko resets it.
+	if _, err := b.Execute("SELECT 42"); err != nil {
+		t.Fatal(err)
+	}
+	// A comes back: its SET NAMES must be replayed on the reused conn.
+	if _, err := a.Execute("SELECT 42"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := counters.accepted.Load(); got != 1 {
+		t.Errorf("backend saw %d connections, want 1 (SET NAMES must not pin)", got)
+	}
+	if got := counters.countQueries("SET NAMES utf8mb4"); got != 2 {
+		t.Errorf("backend saw SET NAMES %d times, want 2 (original + replay)", got)
+	}
+}
+
+// TestTempTablePins: CREATE TEMPORARY TABLE ties the session to its
+// connection for good.
+func TestTempTablePins(t *testing.T) {
+	backendAddr, counters := startFakeMySQL(t, "piko", "backendpass")
+	pikoAddr := startPiko(t, backendAddr)
+
+	a, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err := a.Execute("CREATE TEMPORARY TABLE tmp_report (id INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Execute("SELECT 42"); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := b.Execute("SELECT 42"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := counters.accepted.Load(); got != 2 {
+		t.Errorf("backend saw %d connections with a temp-table session, want 2", got)
+	}
+}
+
 // TestQueryRewrite: configured rewrites are applied before the query
 // reaches the backend.
 func TestQueryRewrite(t *testing.T) {
@@ -266,6 +446,38 @@ func TestQueryRewrite(t *testing.T) {
 	}
 	if got := counters.lastQuery.Load(); got != "SELECT ID FROM wp_posts LIMIT 1" {
 		t.Fatalf("backend received %q, want the rewritten query", got)
+	}
+}
+
+// TestMaxClientConnections: connections beyond the cap are refused.
+func TestMaxClientConnections(t *testing.T) {
+	backendAddr, _ := startFakeMySQL(t, "piko", "backendpass")
+	pikoAddr := startPikoWith(t, backendAddr, pikoOpts{maxClients: 1})
+
+	a, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	if b, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp"); err == nil {
+		b.Close()
+		t.Fatal("expected the second connection to be rejected")
+	}
+
+	// Closing the first frees a slot.
+	a.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+		if err == nil {
+			c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connection still rejected after slot freed: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

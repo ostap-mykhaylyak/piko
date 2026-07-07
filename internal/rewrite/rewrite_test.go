@@ -41,6 +41,30 @@ func TestApply(t *testing.T) {
 	}
 }
 
+// TestSetRules: rules are swappable at runtime (hot reload).
+func TestSetRules(t *testing.T) {
+	rw := newRewriter(t, nil)
+	if got, applied := rw.Apply("SELECT 1 ORDER BY RAND()"); applied != nil {
+		t.Fatalf("empty rewriter applied rules: %q %v", got, applied)
+	}
+
+	err := rw.SetRules([]Rule{{Name: "no-rand", Match: `(?i)\s*ORDER\s+BY\s+RAND\s*\(\s*\)`, Replace: ""}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := rw.Apply("SELECT 1 ORDER BY RAND()"); got != "SELECT 1" {
+		t.Fatalf("reloaded rule not applied: %q", got)
+	}
+
+	// Invalid reload keeps the previous rules.
+	if err := rw.SetRules([]Rule{{Name: "bad", Match: "(["}}); err == nil {
+		t.Fatal("expected error for invalid regex")
+	}
+	if got, _ := rw.Apply("SELECT 1 ORDER BY RAND()"); got != "SELECT 1" {
+		t.Fatalf("previous rules lost after failed reload: %q", got)
+	}
+}
+
 func TestCompileErrors(t *testing.T) {
 	if _, err := New([]Rule{{Name: "bad", Match: "(["}}, slog.New(slog.DiscardHandler)); err == nil {
 		t.Fatal("expected error for invalid regex")

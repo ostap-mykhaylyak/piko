@@ -12,6 +12,7 @@ import (
 
 	"log/slog"
 
+	"github.com/ostap-mykhaylyak/piko/internal/cache"
 	"github.com/ostap-mykhaylyak/piko/internal/config"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
 )
@@ -46,7 +47,11 @@ type Profiler struct {
 	overflow uint64
 
 	advisor *advisor
+	cache   *cache.Cache // optional, adds cache statistics to the report
 }
+
+// SetCache attaches the query cache so reports include its statistics.
+func (p *Profiler) SetCache(c *cache.Cache) { p.cache = c }
 
 // New creates the profiler; call Run to start the reporting loop.
 func New(cfg config.Profiling, p *pool.Pool, log *slog.Logger) *Profiler {
@@ -174,6 +179,23 @@ func (p *Profiler) report(ctx context.Context) {
 			"cache_hit_ratio", ratio(st.cached, st.calls),
 			"db", st.db,
 			"query", st.digest)
+	}
+
+	if p.cache != nil {
+		rep := p.cache.ReportStats()
+		p.log.Info("cache report",
+			"hits", rep.Hits,
+			"misses", rep.Misses,
+			"hit_ratio", ratio(rep.Hits, rep.Hits+rep.Misses),
+			"entries", rep.Entries,
+			"memory_bytes", rep.Bytes)
+		for name, src := range rep.Sources {
+			p.log.Info("cache source",
+				"source", name,
+				"hits", src.Hits,
+				"entries", src.Entries,
+				"memory_bytes", src.Bytes)
+		}
 	}
 
 	if p.cfg.SuggestRewrites {

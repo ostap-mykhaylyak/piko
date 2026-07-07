@@ -25,6 +25,10 @@ type Config struct {
 // Listen configures the client-facing listener.
 type Listen struct {
 	Address string `yaml:"address"`
+	// MaxConnections caps concurrent client connections (0 = unlimited);
+	// connections beyond the cap are closed immediately instead of piling
+	// up behind a saturated backend.
+	MaxConnections int `yaml:"max_connections"`
 }
 
 // Backend is the MySQL server piko forwards to. Username and password are
@@ -58,6 +62,26 @@ type Pool struct {
 	// AcquireTimeout bounds how long a client waits for a connection when
 	// the pool is exhausted.
 	AcquireTimeout time.Duration `yaml:"acquire_timeout"`
+	// Multiplexing releases the backend connection back to the pool between
+	// queries whenever the session state allows it, so many client sessions
+	// share few backend connections. Sessions holding state (transactions,
+	// temp tables, locks, prepared statements, user variables...) keep
+	// their connection automatically.
+	Multiplexing bool `yaml:"multiplexing"`
+	// Breaker protects against a dead or unreachable backend.
+	Breaker Breaker `yaml:"breaker"`
+}
+
+// Breaker is the circuit breaker: after Failures consecutive connection
+// failures piko fails fast instead of letting every PHP worker wait for
+// its own timeout, and probes the backend until it recovers.
+type Breaker struct {
+	// Failures is how many consecutive dial failures open the circuit
+	// (0 disables the breaker).
+	Failures int `yaml:"failures"`
+	// ProbeInterval is how often the backend is probed while the circuit
+	// is open.
+	ProbeInterval time.Duration `yaml:"probe_interval"`
 }
 
 // Cache controls the WordPress-aware in-memory query cache.
@@ -79,6 +103,9 @@ type Cache struct {
 	// RulesDir holds extra cache rule drop-ins (conf.d). Empty means
 	// "conf.d next to the config file".
 	RulesDir string `yaml:"rules_dir"`
+	// Warmup re-populates the alloptions snapshot in the background after
+	// invalidations, so the next pageload finds it hot.
+	Warmup bool `yaml:"warmup"`
 }
 
 // Profiling controls query statistics, slow query logging and index
@@ -118,6 +145,11 @@ func Default() Config {
 			PingInterval:   30 * time.Second,
 			IdleTimeout:    5 * time.Minute,
 			AcquireTimeout: 5 * time.Second,
+			Multiplexing:   true,
+			Breaker: Breaker{
+				Failures:      3,
+				ProbeInterval: 2 * time.Second,
+			},
 		},
 		Cache: Cache{
 			Enabled:         true,
@@ -127,6 +159,7 @@ func Default() Config {
 			DefaultTTL:      5 * time.Minute,
 			MaxEntries:      10000,
 			MaxResultBytes:  1 << 20, // 1 MiB
+			Warmup:          true,
 		},
 		Profiling: Profiling{
 			SlowQuery:       500 * time.Millisecond,
@@ -202,6 +235,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Pool.AcquireTimeout <= 0 {
 		return fmt.Errorf("pool.acquire_timeout must be > 0")
+	}
+	if c.Pool.Breaker.Failures < 0 {
+		return fmt.Errorf("pool.breaker.failures must be >= 0 (0 disables it)")
+	}
+	if c.Pool.Breaker.Failures > 0 && c.Pool.Breaker.ProbeInterval <= 0 {
+		return fmt.Errorf("pool.breaker.probe_interval must be > 0")
+	}
+	if c.Listen.MaxConnections < 0 {
+		return fmt.Errorf("listen.max_connections must be >= 0 (0 = unlimited)")
 	}
 	if c.Cache.Enabled {
 		if c.Cache.TablePrefix == "" {
