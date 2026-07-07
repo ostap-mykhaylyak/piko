@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +63,15 @@ func (h fakeHandler) HandleQuery(query string) (*mysql.Result, error) {
 	h.counters.record(query)
 	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "SELECT") {
 		return &mysql.Result{AffectedRows: 1}, nil
+	}
+	// FOUND_ROWS() returns the pagination total (a distinctive value).
+	if strings.Contains(strings.ToUpper(query), "FOUND_ROWS()") &&
+		!strings.Contains(strings.ToUpper(query), "SQL_CALC") {
+		rs, err := mysql.BuildSimpleTextResultset([]string{"FOUND_ROWS()"}, [][]any{{int64(137)}})
+		if err != nil {
+			return nil, err
+		}
+		return mysql.NewResult(rs), nil
 	}
 	rs, err := mysql.BuildSimpleTextResultset([]string{"v"}, [][]any{{int64(42)}})
 	if err != nil {
@@ -425,6 +436,81 @@ func TestTempTablePins(t *testing.T) {
 
 	if got := counters.accepted.Load(); got != 2 {
 		t.Errorf("backend saw %d connections with a temp-table session, want 2", got)
+	}
+}
+
+// TestSearchPairingCache: a SQL_CALC_FOUND_ROWS product listing and its
+// FOUND_ROWS() companion are cached together, so a repeat is served entirely
+// from memory with a correct pagination count.
+func TestSearchPairingCache(t *testing.T) {
+	backendAddr, counters := startFakeMySQL(t, "piko", "backendpass")
+
+	// A cache with a product-listing rule, built via LoadRuleDir so the
+	// rule regex is compiled the same way production does.
+	dir := t.TempDir()
+	rule := "rules:\n" +
+		"  - name: listing\n" +
+		"    match: \"(?is)^SELECT SQL_CALC_FOUND_ROWS.*FROM wp_posts.*post_type = 'product'\"\n" +
+		"    ttl: 60s\n" +
+		"    invalidate_on: [wp_posts]\n"
+	if err := os.WriteFile(filepath.Join(dir, "wc.yaml"), []byte(rule), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set, err := cache.LoadRuleDir(dir, "wp_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qc := cache.New(config.Default().Cache, set.Cache, slog.New(slog.DiscardHandler))
+	pikoAddr := startPikoWith(t, backendAddr, pikoOpts{cache: qc})
+
+	conn, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	listing := "SELECT SQL_CALC_FOUND_ROWS wp_posts.ID FROM wp_posts WHERE post_type = 'product' ORDER BY wp_posts.post_date DESC LIMIT 0, 10"
+
+	runPair := func() int64 {
+		if _, err := conn.Execute(listing); err != nil {
+			t.Fatalf("listing query: %v", err)
+		}
+		r, err := conn.Execute("SELECT FOUND_ROWS()")
+		if err != nil {
+			t.Fatalf("FOUND_ROWS(): %v", err)
+		}
+		got, err := r.GetInt(0, 0)
+		if err != nil {
+			t.Fatalf("reading FOUND_ROWS(): %v", err)
+		}
+		return got
+	}
+
+	// First pair: both hit the backend and the count is captured.
+	if n := runPair(); n != 137 {
+		t.Fatalf("first FOUND_ROWS() = %d, want 137", n)
+	}
+	// Second pair: served entirely from cache, count still correct.
+	if n := runPair(); n != 137 {
+		t.Fatalf("second FOUND_ROWS() = %d, want 137", n)
+	}
+
+	if got := counters.countQueries("SQL_CALC_FOUND_ROWS"); got != 1 {
+		t.Errorf("backend saw the listing %d times, want 1 (cache miss loop)", got)
+	}
+	if got := counters.countQueries("SELECT FOUND_ROWS()"); got != 1 {
+		t.Errorf("backend saw FOUND_ROWS() %d times, want 1", got)
+	}
+
+	// A write to wp_posts invalidates the listing.
+	if _, err := conn.Execute("UPDATE wp_posts SET post_status = 'publish' WHERE ID = 5"); err != nil {
+		t.Fatal(err)
+	}
+	if n := runPair(); n != 137 {
+		t.Fatalf("post-invalidation FOUND_ROWS() = %d, want 137", n)
+	}
+	if got := counters.countQueries("SQL_CALC_FOUND_ROWS"); got != 2 {
+		t.Errorf("listing not re-fetched after invalidation: backend saw it %d times, want 2", got)
 	}
 }
 

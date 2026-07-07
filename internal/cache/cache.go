@@ -42,6 +42,7 @@ type Cache struct {
 	optionsTable string
 	autoloadRe   *regexp.Regexp
 	optionRe     *regexp.Regexp
+	optionInRe   *regexp.Regexp
 
 	mu      sync.Mutex
 	entries map[string]*entry
@@ -51,6 +52,10 @@ type Cache struct {
 	sources map[string]*sourceStat // per-source hit/entry counters
 	learned map[string]string      // db -> exact alloptions query seen
 
+	// hits counts served-from-cache lookups; misses counts cacheable
+	// queries that had to hit the backend. Non-cacheable traffic (most of
+	// a WordPress workload) is excluded, so hits/(hits+misses) is a
+	// meaningful cache hit ratio.
 	hits, misses uint64
 
 	// refetch, when set, is invoked (asynchronously by the warmer) after
@@ -67,6 +72,13 @@ type entry struct {
 	source  string
 	bytes   int
 	elem    *list.Element
+
+	// For SQL_CALC_FOUND_ROWS search entries: the paired FOUND_ROWS()
+	// count. hasFoundRows is false until captured, and the entry is not
+	// served until then (otherwise the client's FOUND_ROWS() would be
+	// wrong).
+	foundRows    uint64
+	hasFoundRows bool
 }
 
 // sourceStat aggregates per-source cache statistics (alloptions,
@@ -89,6 +101,11 @@ func New(cfg config.Cache, rules []Rule, log *slog.Logger) *Cache {
 			`(?i)^SELECT\s+option_name\s*,\s*option_value\s+FROM\s+` + prefix + `options\s+WHERE\s+autoload\b`),
 		optionRe: regexp.MustCompile(
 			`(?i)^SELECT\s+option_value\s+FROM\s+` + prefix + `options\s+WHERE\s+option_name\s*=\s*'([^'\\]+)'\s+LIMIT\s+1\s*$`),
+		// The batch form WordPress actually uses for transients:
+		//   SELECT option_name, option_value FROM {p}options
+		//   WHERE option_name IN ('_transient_x','_transient_timeout_x')
+		optionInRe: regexp.MustCompile(
+			`(?i)^SELECT\s+option_name\s*,\s*option_value\s+FROM\s+` + prefix + `options\s+WHERE\s+option_name\s+IN\s*\(([^)]*)\)\s*$`),
 		entries: make(map[string]*entry),
 		lru:     list.New(),
 		byTag:   make(map[string]map[*entry]struct{}),
@@ -127,12 +144,10 @@ func (c *Cache) Lookup(db, query string) (*mysql.Result, bool) {
 
 	e, ok := c.entries[key]
 	if !ok {
-		c.misses++
 		return nil, false
 	}
 	if time.Now().After(e.expires) {
 		c.removeLocked(e)
-		c.misses++
 		return nil, false
 	}
 	c.lru.MoveToFront(e.elem)
@@ -144,9 +159,20 @@ func (c *Cache) Lookup(db, query string) (*mysql.Result, bool) {
 	return e.result, true
 }
 
-// Store caches the result when the query matches a cacheable pattern.
-// The result is shared read-only between sessions afterwards.
+// Store caches a client query result. Reaching Store past a Lookup miss
+// means the query was cacheable but not cached — a real (cacheable) miss —
+// so the hit ratio reflects only cacheable traffic, not the whole workload.
 func (c *Cache) Store(db, query string, r *mysql.Result) {
+	c.store(db, query, r, true)
+}
+
+// Warm caches a result the warmer fetched proactively; it is neither a hit
+// nor a miss, so it must not move the counters.
+func (c *Cache) Warm(db, query string, r *mysql.Result) {
+	c.store(db, query, r, false)
+}
+
+func (c *Cache) store(db, query string, r *mysql.Result, countMiss bool) {
 	if r == nil || !r.HasResultset() {
 		return
 	}
@@ -163,6 +189,20 @@ func (c *Cache) Store(db, query string, r *mysql.Result) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if countMiss {
+		c.misses++
+	}
+	c.insertLocked(key, r, ttl, tags, source, size)
+
+	// Remember the exact alloptions query so the warmer can re-populate it
+	// after invalidations.
+	if source == "alloptions" {
+		c.learned[db] = query
+	}
+}
+
+// insertLocked adds (or replaces) an entry and returns it. Caller holds mu.
+func (c *Cache) insertLocked(key string, r *mysql.Result, ttl time.Duration, tags []string, source string, size int) *entry {
 	if old, exists := c.entries[key]; exists {
 		c.removeLocked(old)
 	}
@@ -196,18 +236,110 @@ func (c *Cache) Store(db, query string, r *mysql.Result) {
 		}
 		set[e] = struct{}{}
 	}
+	return e
+}
 
-	// Remember the exact alloptions query so the warmer can re-populate it
-	// after invalidations.
-	if source == "alloptions" {
-		c.learned[db] = query
+// searchKey namespaces search entries so they never collide with normal
+// reads of the same text.
+func searchKey(db, query string) string { return db + "\x00search\x00" + query }
+
+// LookupSearch returns the cached rows of a SQL_CALC_FOUND_ROWS query and
+// its paired FOUND_ROWS() count. ok is true only when both the rows and the
+// count are cached — serving rows without the matching count would corrupt
+// the client's pagination.
+func (c *Cache) LookupSearch(db, query string) (*mysql.Result, uint64, bool) {
+	key := searchKey(db, query)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	e, ok := c.entries[key]
+	if !ok || !e.hasFoundRows {
+		return nil, 0, false
 	}
+	if time.Now().After(e.expires) {
+		c.removeLocked(e)
+		return nil, 0, false
+	}
+	c.lru.MoveToFront(e.elem)
+	c.hits++
+	if st := c.sources[e.source]; st != nil {
+		st.Hits++
+	}
+	return e.result, e.foundRows, true
+}
+
+// StoreSearch caches the rows of a SQL_CALC_FOUND_ROWS query that matched a
+// conf.d rule. The FOUND_ROWS() count is filled in later by PairFoundRows;
+// until then the entry is not served.
+func (c *Cache) StoreSearch(db, query string, r *mysql.Result) {
+	if r == nil || !r.HasResultset() {
+		return
+	}
+	ttl, tags, source, ok := c.cacheableSearch(db, query)
+	if !ok {
+		return
+	}
+	size := resultSize(r)
+	if size > c.cfg.MaxResultBytes {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.misses++
+	c.insertLocked(searchKey(db, query), r, ttl, tags, source, size)
+}
+
+// PairFoundRows records the FOUND_ROWS() count for a previously stored
+// search query, completing the entry so it can be served.
+func (c *Cache) PairFoundRows(db, query string, foundRows uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[searchKey(db, query)]; ok {
+		e.foundRows = foundRows
+		e.hasFoundRows = true
+	}
+}
+
+// SearchCacheable reports whether a SQL_CALC_FOUND_ROWS query matches a
+// conf.d rule (so the session knows whether to run the pairing dance).
+func (c *Cache) SearchCacheable(db, query string) bool {
+	_, _, _, ok := c.cacheableSearch(db, query)
+	return ok
+}
+
+// cacheableSearch decides whether a SQL_CALC_FOUND_ROWS query may be cached
+// via a conf.d rule. The built-in options/transient patterns never apply
+// here; only user rules do.
+func (c *Cache) cacheableSearch(db, query string) (time.Duration, []string, string, bool) {
+	if unsafeForSearch(query) {
+		return 0, nil, "", false
+	}
+	c.rulesMu.RLock()
+	defer c.rulesMu.RUnlock()
+	for i := range c.rules {
+		r := &c.rules[i]
+		if !r.re.MatchString(query) {
+			continue
+		}
+		ttl := r.TTL
+		if ttl <= 0 {
+			ttl = c.cfg.DefaultTTL.Std()
+		}
+		tags := make([]string, 0, len(r.InvalidateOn))
+		for _, table := range r.InvalidateOn {
+			tags = append(tags, tagTable(db, table))
+		}
+		return ttl, tags, "rule:" + r.Name, true
+	}
+	return 0, nil, "", false
 }
 
 // cacheable decides whether a SELECT may be cached, how, and under which
 // statistics source.
 func (c *Cache) cacheable(db, query string) (time.Duration, []string, string, bool) {
-	if unsafeSelectRe.MatchString(query) {
+	if unsafeForCache(query) {
 		return 0, nil, "", false
 	}
 
@@ -227,6 +359,27 @@ func (c *Cache) cacheable(db, query string) (time.Duration, []string, string, bo
 				}, "transients", true
 			}
 			return 0, nil, "", false
+		}
+		// Batch read of a transient and its timeout companion (the form
+		// WordPress actually emits). Cache only when every option is a
+		// transient, tagging each so any write to them invalidates it.
+		if m := c.optionInRe.FindStringSubmatch(query); m != nil {
+			names := extractQuotedList(m[1])
+			if len(names) > 0 {
+				tags := make([]string, 0, len(names)+1)
+				tags = append(tags, tagTable(db, c.optionsTable))
+				allTransient := true
+				for _, n := range names {
+					if !isTransientName(n) {
+						allTransient = false
+						break
+					}
+					tags = append(tags, tagOption(db, n))
+				}
+				if allTransient {
+					return c.cfg.DefaultTTL.Std(), tags, "transients", true
+				}
+			}
 		}
 	}
 
@@ -260,15 +413,25 @@ func (c *Cache) InvalidateWrite(db, query string) {
 
 	c.mu.Lock()
 	optionsWrite := table == c.optionsTable
+	hitAutoload := false
 	if optionsWrite {
 		if names := extractOptionNames(query); len(names) > 0 {
-			// Attributed options write: the alloptions snapshot may contain
-			// any of these options, single-option entries only their own.
-			c.dropTagLocked(tagAlloptions(db))
+			// Attributed options write: drop the single-option entries, and
+			// the alloptions snapshot only if an autoloaded option can be
+			// affected. Transient writes (autoload='off') leave it alone —
+			// otherwise WooCommerce's constant transient churn would keep
+			// evicting the single hottest cache entry.
+			hitAutoload = writeHitsAutoload(names)
+			if hitAutoload {
+				c.dropTagLocked(tagAlloptions(db))
+			}
 			for _, name := range names {
 				c.dropTagLocked(tagOption(db, name))
 			}
 		} else {
+			// Unattributable options write: drop everything options-tagged,
+			// alloptions included.
+			hitAutoload = true
 			c.dropTagLocked(tagTable(db, table))
 		}
 	} else {
@@ -278,9 +441,9 @@ func (c *Cache) InvalidateWrite(db, query string) {
 	warm, learned := c.learned[db]
 	c.mu.Unlock()
 
-	// Every options write drops the alloptions snapshot: hand it to the
-	// warmer so the next pageload finds it hot again.
-	if optionsWrite && learned && refetch != nil {
+	// Re-warm the alloptions snapshot only when this write actually dropped
+	// it, so transient churn no longer triggers pointless refetches.
+	if optionsWrite && hitAutoload && learned && refetch != nil {
 		refetch(db, warm)
 	}
 }

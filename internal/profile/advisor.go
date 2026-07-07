@@ -71,6 +71,25 @@ func (a *advisor) explainQuery(conn dbExecutor, st *queryStat) error {
 			continue
 		}
 
+		// A leading-wildcard LIKE ('%term%') cannot use a B-tree index, so
+		// suggesting one would be useless; a FULLTEXT index (or a search
+		// plugin) is the real fix. This is the WooCommerce product-search
+		// killer.
+		if cols := likeColumns(st.sample, table); len(cols) > 0 {
+			if a.once("fulltext|" + st.db + "|" + table + "|" + strings.Join(cols, ",")) {
+				a.log.Warn("index suggestion",
+					"action", "fulltext",
+					"db", st.db,
+					"table", table,
+					"columns", strings.Join(cols, ", "),
+					"reason", fmt.Sprintf("scans ~%d rows for a LIKE '%%...%%' search that no B-tree index can serve", rows),
+					"query", st.digest,
+					"sql", fmt.Sprintf("ALTER TABLE `%s` ADD FULLTEXT INDEX `%s` (`%s`);  -- then use MATCH...AGAINST, or a search plugin (FiboSearch, Relevanssi)",
+						table, "ft_piko_"+strings.Join(cols, "_"), strings.Join(cols, "`, `")))
+			}
+			continue
+		}
+
 		columns := suggestColumns(st.sample, table)
 		if len(columns) == 0 {
 			if a.once("scan|" + st.db + "|" + st.digest) {
@@ -134,6 +153,25 @@ func suggestColumns(query, table string) []string {
 		add(m[1])
 	}
 	return columns
+}
+
+// likeColumns returns the columns of table used in a leading-wildcard LIKE
+// ('%term%'), which a FULLTEXT index would serve. Only table-qualified
+// predicates are matched (the shape WordPress generates), so columns of
+// other joined tables are not mistaken for this table's.
+func likeColumns(query, table string) []string {
+	re := regexp.MustCompile(`(?i)\x60?` + regexp.QuoteMeta(table) + `\x60?\.\x60?([a-z_][\w$]*)\x60?\s+LIKE\s+'%`)
+	var cols []string
+	seen := map[string]struct{}{}
+	for _, m := range re.FindAllStringSubmatch(query, -1) {
+		c := strings.ToLower(m[1])
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		cols = append(cols, c)
+	}
+	return cols
 }
 
 // reviewSchema looks for duplicate indexes (via information_schema) and

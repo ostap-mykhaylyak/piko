@@ -99,6 +99,6 @@ func (w *Warmer) refetch(ctx context.Context, db, query string) {
 	}
 	w.pool.ReleaseClean(conn)
 
-	w.cache.Store(db, query, r)
+	w.cache.Warm(db, query, r)
 	w.log.Debug("cache warmed", "db", db)
 }

@@ -140,12 +140,70 @@ func extractOptionNames(query string) []string {
 	return names
 }
 
+var quotedItemRe = regexp.MustCompile(`'([^'\\]*)'`)
+
+// extractQuotedList returns the single-quoted items of an IN (...) list.
+func extractQuotedList(list string) []string {
+	var names []string
+	for _, m := range quotedItemRe.FindAllStringSubmatch(list, -1) {
+		names = append(names, m[1])
+	}
+	return names
+}
+
 // isTransientName reports whether an option holds a WordPress transient.
+// This also covers the "_transient_timeout_*" / "_site_transient_timeout_*"
+// companion rows, since they share the "_transient_"/"_site_transient_"
+// prefixes.
 func isTransientName(name string) bool {
 	return strings.HasPrefix(name, "_transient_") ||
 		strings.HasPrefix(name, "_site_transient_")
 }
 
-// unsafeSelectRe matches reads that must never be served from cache:
+// writeHitsAutoload reports whether a write to the options table can affect
+// an autoloaded option (and thus the alloptions snapshot). Writes that only
+// touch transients are treated as non-autoload: WordPress stores transients
+// that have an expiration with autoload='off' (see the INSERT ... VALUES
+// (..., 'off') that WooCommerce emits constantly), so invalidating the
+// alloptions snapshot for them is both unnecessary and ruinous for the hit
+// rate. A write piko cannot attribute (empty names) is treated as hitting
+// autoload, to stay safe.
+func writeHitsAutoload(names []string) bool {
+	if len(names) == 0 {
+		return true
+	}
+	for _, n := range names {
+		if !isTransientName(n) {
+			return true
+		}
+	}
+	return false
+}
+
+// volatileSelectRe matches reads that must never be served from cache:
 // locking reads and session/time dependent functions.
-var unsafeSelectRe = regexp.MustCompile(`(?i)\b(?:FOR\s+UPDATE|LOCK\s+IN\s+SHARE\s+MODE|LAST_INSERT_ID\s*\(|FOUND_ROWS\s*\(|ROW_COUNT\s*\(|CONNECTION_ID\s*\(|RAND\s*\(|UUID\w*\s*\(|NOW\s*\(|SYSDATE\s*\(|CURDATE\s*\(|CURTIME\s*\(|CURRENT_\w+|SQL_CALC_FOUND_ROWS|GET_LOCK\s*\()`)
+var volatileSelectRe = regexp.MustCompile(`(?i)\b(?:FOR\s+UPDATE|LOCK\s+IN\s+SHARE\s+MODE|LAST_INSERT_ID\s*\(|FOUND_ROWS\s*\(|ROW_COUNT\s*\(|CONNECTION_ID\s*\(|RAND\s*\(|UUID\w*\s*\(|NOW\s*\(|SYSDATE\s*\(|CURDATE\s*\(|CURTIME\s*\(|CURRENT_\w+|GET_LOCK\s*\()`)
+
+var (
+	calcFoundRowsRe  = regexp.MustCompile(`(?i)\bSQL_CALC_FOUND_ROWS\b`)
+	foundRowsQueryRe = regexp.MustCompile(`(?i)^\s*SELECT\s+FOUND_ROWS\s*\(\s*\)\s*$`)
+)
+
+// unsafeForCache reports whether a query is uncacheable through the normal
+// path. SQL_CALC_FOUND_ROWS queries are excluded here: they can only be
+// cached via the search path, which also caches the paired FOUND_ROWS().
+func unsafeForCache(query string) bool {
+	return volatileSelectRe.MatchString(query) || calcFoundRowsRe.MatchString(query)
+}
+
+// unsafeForSearch reports whether a SQL_CALC_FOUND_ROWS query is uncacheable
+// even on the search path (it carries other volatile constructs).
+func unsafeForSearch(query string) bool {
+	return volatileSelectRe.MatchString(query)
+}
+
+// HasCalcFoundRows reports whether the query uses SQL_CALC_FOUND_ROWS.
+func HasCalcFoundRows(query string) bool { return calcFoundRowsRe.MatchString(query) }
+
+// IsFoundRowsQuery reports whether the query is exactly SELECT FOUND_ROWS().
+func IsFoundRowsQuery(query string) bool { return foundRowsQueryRe.MatchString(query) }

@@ -46,9 +46,16 @@ configured with a single `config.yaml`.
   `/etc/piko/conf.d/` add cache rules as regex + TTL + invalidation tables.
   `piko --init` installs a WooCommerce profile covering the product-data
   queries that hammer shops (postmeta lookups, attribute taxonomies, term
-  lookups). The `{prefix}` placeholder expands to `cache.table_prefix`, so
-  rules work with any `$table_prefix`. Carts and customer sessions are
-  deliberately never cached.
+  lookups, product listings). The `{prefix}` placeholder expands to
+  `cache.table_prefix`, so rules work with any `$table_prefix`. Carts and
+  customer sessions are deliberately never cached.
+- **Paginated listing caching** — WooCommerce product listings use
+  `SQL_CALC_FOUND_ROWS` + `FOUND_ROWS()` for page counts. piko caches the
+  rows **and** the pagination count together and replays both, so the shop
+  and category pages (identical for every visitor) are served from memory
+  with correct "page X of Y" counts. Serving a listing without its matching
+  count is impossible by construction — the entry is withheld until the
+  count is paired.
 - **Hot reload** — `SIGHUP` (or `systemctl reload piko`) re-reads the
   conf.d drop-ins (cache rules and rewrites) without dropping a single
   client connection. A failed reload keeps the previous rules.
@@ -172,6 +179,9 @@ every query — into optimization guidance, written to the standard log:
   - *drop (unused)*: an index with zero reads since the MySQL server started
     (requires `performance_schema`); verify over a full business cycle
     before dropping.
+  - *fulltext*: a `LIKE '%term%'` search scans a large table and no B-tree
+    index can help — piko suggests a `FULLTEXT` index (or a search plugin).
+    This is the classic WooCommerce product-search bottleneck.
 
 ```yaml
 profiling:

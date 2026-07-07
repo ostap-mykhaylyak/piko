@@ -36,6 +36,19 @@ rules:
     ttl: 5m
     invalidate_on: ["{prefix}terms", "{prefix}term_taxonomy", "{prefix}term_relationships"]
 
+  # Product listing / search queries (shop, category, filters, search box).
+  # These use SQL_CALC_FOUND_ROWS + FOUND_ROWS() for pagination; piko caches
+  # the rows and the pagination count together, so the page counts stay
+  # correct. Shop/category page 1 is identical for every visitor, so this is
+  # a big win; searches (LIKE '%...%') are also cached but their high
+  # cardinality means a lower hit rate (the real fix for those is a FULLTEXT
+  # index or a search plugin — see piko's "fulltext" index suggestions).
+  # Short TTL keeps listings fresh as products, stock and prices change.
+  - name: product-listing
+    match: "(?is)^SELECT SQL_CALC_FOUND_ROWS\\s+{prefix}posts\\.ID\\s+FROM {prefix}posts\\b.*\\bpost_type\\s*=\\s*'product'"
+    ttl: 60s
+    invalidate_on: ["{prefix}posts", "{prefix}postmeta"]
+
 # Query rewrites: each rule replaces every regex match in the query text
 # before execution (replace supports $1 capture references; empty deletes
 # the match). Disabled by default because rewrites change semantics: enable

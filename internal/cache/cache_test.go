@@ -82,6 +82,50 @@ func TestTransientCache(t *testing.T) {
 	}
 }
 
+// TestTransientBatchRead: the IN(...) form WordPress uses for transients is
+// cacheable and tagged per option name.
+func TestTransientBatchRead(t *testing.T) {
+	c := testCache(t, nil)
+	q := "SELECT option_name, option_value FROM wp_options WHERE option_name IN ('_transient_wc_x','_transient_timeout_wc_x')"
+
+	c.Store("wp", q, testResult(t))
+	if _, ok := c.Lookup("wp", q); !ok {
+		t.Fatal("batch transient read should be cached")
+	}
+
+	// The INSERT ... ON DUPLICATE that WooCommerce emits invalidates it.
+	c.InvalidateWrite("wp", "INSERT INTO `wp_options` (`option_name`, `option_value`, `autoload`) VALUES ('_transient_wc_x', 'v', 'off') ON DUPLICATE KEY UPDATE `option_value` = VALUES(`option_value`)")
+	if _, ok := c.Lookup("wp", q); ok {
+		t.Fatal("batch transient read should be invalidated by a write to one of its options")
+	}
+
+	// A batch that includes a non-transient option is not cached.
+	mixed := "SELECT option_name, option_value FROM wp_options WHERE option_name IN ('_transient_wc_x','siteurl')"
+	c.Store("wp", mixed, testResult(t))
+	if _, ok := c.Lookup("wp", mixed); ok {
+		t.Fatal("batch with a non-transient option must not be cached")
+	}
+}
+
+// TestTransientWriteKeepsAlloptions: a transient write (autoload='off')
+// must not evict the alloptions snapshot — the WooCommerce hot-path fix.
+func TestTransientWriteKeepsAlloptions(t *testing.T) {
+	c := testCache(t, nil)
+	c.Store("wp", autoloadQ, testResult(t))
+
+	// The exact INSERT WooCommerce emits for a transient with expiration.
+	c.InvalidateWrite("wp", "INSERT INTO `wp_options` (`option_name`, `option_value`, `autoload`) VALUES ('_transient_timeout_wc_related_29319', '1783506003', 'off') ON DUPLICATE KEY UPDATE `option_name` = VALUES(`option_name`), `option_value` = VALUES(`option_value`), `autoload` = VALUES(`autoload`)")
+	if _, ok := c.Lookup("wp", autoloadQ); !ok {
+		t.Fatal("a transient write must not evict the alloptions snapshot")
+	}
+
+	// A write to a real (non-transient) option still evicts it.
+	c.InvalidateWrite("wp", "UPDATE wp_options SET option_value = 'x' WHERE option_name = 'blogname'")
+	if _, ok := c.Lookup("wp", autoloadQ); ok {
+		t.Fatal("a normal option write must still evict the alloptions snapshot")
+	}
+}
+
 func TestUnattributedOptionsWrite(t *testing.T) {
 	c := testCache(t, nil)
 	c.Store("wp", autoloadQ, testResult(t))
@@ -125,6 +169,41 @@ func TestRuleCache(t *testing.T) {
 	c.InvalidateWrite("wp", "UPDATE wp_postmeta SET meta_value = '1' WHERE meta_id = 9")
 	if _, ok := c.Lookup("wp", q); ok {
 		t.Fatal("entry should be invalidated by a postmeta write")
+	}
+}
+
+// TestSearchPairing: a search entry is not served until its FOUND_ROWS()
+// count is paired, and a write to an invalidation table drops it.
+func TestSearchPairing(t *testing.T) {
+	rule := Rule{Name: "listing", Match: `(?is)^SELECT SQL_CALC_FOUND_ROWS.*FROM wp_posts`,
+		TTL: time.Minute, InvalidateOn: []string{"wp_posts"}}
+	rule.re = mustCompile(t, rule.Match)
+	c := testCache(t, []Rule{rule})
+
+	q := "SELECT SQL_CALC_FOUND_ROWS wp_posts.ID FROM wp_posts WHERE post_type = 'product' LIMIT 0, 10"
+
+	// Not cacheable via the normal path (SQL_CALC_FOUND_ROWS is unsafe there).
+	c.Store("wp", q, testResult(t))
+	if _, _, ok := c.LookupSearch("wp", q); ok {
+		t.Fatal("normal Store must not create a search entry")
+	}
+
+	// Stored via the search path, but not served until the count is paired.
+	c.StoreSearch("wp", q, testResult(t))
+	if _, _, ok := c.LookupSearch("wp", q); ok {
+		t.Fatal("search entry must not be served before FOUND_ROWS() is paired")
+	}
+
+	c.PairFoundRows("wp", q, 137)
+	r, n, ok := c.LookupSearch("wp", q)
+	if !ok || n != 137 || r == nil {
+		t.Fatalf("paired search entry: ok=%v n=%d", ok, n)
+	}
+
+	// A write to wp_posts invalidates it.
+	c.InvalidateWrite("wp", "UPDATE wp_posts SET post_status = 'publish' WHERE ID = 5")
+	if _, _, ok := c.LookupSearch("wp", q); ok {
+		t.Fatal("search entry should be invalidated by a wp_posts write")
 	}
 }
 
@@ -315,18 +394,22 @@ func TestSetRulesReload(t *testing.T) {
 	}
 }
 
-// TestReportStats: per-source counters follow stores, hits and evictions.
+// TestReportStats: per-source counters follow stores, hits and evictions,
+// and misses count only cacheable queries (not the whole workload).
 func TestReportStats(t *testing.T) {
 	c := testCache(t, nil)
-	c.Store("wp", autoloadQ, testResult(t))
-	c.Store("wp", transientQ, testResult(t))
+	c.Store("wp", autoloadQ, testResult(t))  // cacheable miss #1
+	c.Store("wp", transientQ, testResult(t)) // cacheable miss #2
 	c.Lookup("wp", autoloadQ)
 	c.Lookup("wp", autoloadQ)
 	c.Lookup("wp", transientQ)
+	// A non-cacheable query missing the cache must NOT count as a miss.
 	c.Lookup("wp", "SELECT missing")
+	// A proactive warm refresh must not count as a miss either.
+	c.Warm("wp", autoloadQ, testResult(t))
 
 	rep := c.ReportStats()
-	if rep.Hits != 3 || rep.Misses != 1 || rep.Entries != 2 || rep.Bytes <= 0 {
+	if rep.Hits != 3 || rep.Misses != 2 || rep.Entries != 2 || rep.Bytes <= 0 {
 		t.Fatalf("report = %+v", rep)
 	}
 	if src := rep.Sources["alloptions"]; src.Hits != 2 || src.Entries != 1 {

@@ -74,6 +74,11 @@ type session struct {
 	setStmts  []string // tracked SETs replayed on connection reuse
 	varSig    string   // signature of setStmts
 
+	// SQL_CALC_FOUND_ROWS / FOUND_ROWS() pairing (guarded by mu).
+	calcPending    string // search query executed on the backend, awaiting its FOUND_ROWS()
+	foundRows      uint64 // count to serve for the next FOUND_ROWS() from cache
+	foundRowsKnown bool   // whether foundRows is armed
+
 	stopPing chan struct{}
 	pingDone chan struct{}
 }
@@ -268,6 +273,83 @@ func (s *session) trackSet(query string, act setAction) {
 	}
 }
 
+// handleSearch serves or caches a SQL_CALC_FOUND_ROWS listing query,
+// keeping its rows and pagination count together. Must be called with mu.
+func (s *session) handleSearch(query string) (*mysql.Result, error) {
+	if r, foundRows, ok := s.cache.LookupSearch(s.db, query); ok {
+		// Rows from cache; arm the paired FOUND_ROWS() answer so the
+		// client's pagination stays correct without touching the backend.
+		s.foundRows = foundRows
+		s.foundRowsKnown = true
+		s.calcPending = ""
+		s.lastUse = time.Now()
+		s.profile(query, 0, r, true, nil)
+		return r, nil
+	}
+
+	c, err := s.backend()
+	if err != nil {
+		return nil, err
+	}
+	stopWatchdog := s.queryWatchdog(c, query)
+	start := time.Now()
+	r, err := c.Execute(query)
+	stopWatchdog()
+	s.finish(err)
+	s.profile(query, time.Since(start), r, false, err)
+	if err != nil {
+		return r, err
+	}
+	s.cache.StoreSearch(s.db, query, r)
+	// The next FOUND_ROWS() belongs to this query; keep the same backend
+	// connection so its count is correct, and do not release here.
+	s.calcPending = query
+	s.foundRowsKnown = false
+	return r, nil
+}
+
+// serveFoundRows answers SELECT FOUND_ROWS(): from the pairing cache when
+// the preceding search was a cache hit, otherwise from the backend, in
+// which case the count is captured to complete the pending search entry.
+// Must be called with mu.
+func (s *session) serveFoundRows(query string) (*mysql.Result, error) {
+	if s.foundRowsKnown {
+		r := foundRowsResult(s.foundRows)
+		s.foundRowsKnown = false
+		s.calcPending = ""
+		s.lastUse = time.Now()
+		s.profile(query, 0, r, true, nil)
+		s.maybeRelease()
+		return r, nil
+	}
+
+	c, err := s.backend()
+	if err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	r, err := c.Execute(query)
+	s.finish(err)
+	s.profile(query, time.Since(start), r, false, err)
+	if err == nil && s.calcPending != "" && r != nil && r.Resultset != nil && len(r.Values) > 0 {
+		if n, e := r.GetUint(0, 0); e == nil {
+			s.cache.PairFoundRows(s.db, s.calcPending, n)
+		}
+	}
+	s.calcPending = ""
+	s.maybeRelease()
+	return r, err
+}
+
+// foundRowsResult builds a synthetic FOUND_ROWS() result set.
+func foundRowsResult(n uint64) *mysql.Result {
+	rs, err := mysql.BuildSimpleTextResultset([]string{"FOUND_ROWS()"}, [][]any{{int64(n)}})
+	if err != nil {
+		return &mysql.Result{}
+	}
+	return mysql.NewResult(rs)
+}
+
 // finish records activity and handles connection-level failures: on a
 // network error the backend connection is dropped so the next command gets
 // a fresh one. MySQL-level errors (bad query, duplicate key...) leave the
@@ -373,6 +455,21 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 				"query blocked by piko firewall rule '"+rule+"'")
 		}
 	}
+
+	// SQL_CALC_FOUND_ROWS / FOUND_ROWS() pairing: cache product listings
+	// together with their pagination count. Only outside transactions,
+	// where reads must see the session's own writes.
+	if s.cacheActive() && !s.inTx {
+		if cache.IsFoundRowsQuery(query) {
+			return s.serveFoundRows(query)
+		}
+		if cache.HasCalcFoundRows(query) && s.cache.SearchCacheable(s.db, query) {
+			return s.handleSearch(query)
+		}
+	}
+	// Any other statement breaks a pending calc/FOUND_ROWS() sequence.
+	s.calcPending = ""
+	s.foundRowsKnown = false
 
 	kind := cache.Classify(query)
 

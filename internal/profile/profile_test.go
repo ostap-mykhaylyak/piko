@@ -141,6 +141,37 @@ func TestExplainSmallTableIgnored(t *testing.T) {
 	}
 }
 
+func TestExplainSuggestsFulltext(t *testing.T) {
+	log, buf := testLogger()
+	a := newAdvisor(log)
+
+	exec := &fakeExecutor{results: map[string]*mysql.Result{
+		"EXPLAIN": resultOf(t,
+			[]string{"id", "select_type", "table", "type", "possible_keys", "key", "rows", "Extra"},
+			[][]any{{int64(1), "SIMPLE", "wpxyz_posts", "ALL", "", "", int64(80000), "Using where"}}),
+	}}
+	st := &queryStat{
+		db:     "wp",
+		digest: "SELECT ... FROM wpxyz_posts WHERE post_title LIKE ?",
+		sample: "SELECT wpxyz_posts.ID FROM wpxyz_posts WHERE wpxyz_posts.post_title LIKE '%cilindro%' OR wpxyz_posts.post_content LIKE '%cilindro%'",
+	}
+	if err := a.explainQuery(exec, st); err != nil {
+		t.Fatal(err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "action=fulltext") || !strings.Contains(out, "FULLTEXT") {
+		t.Fatalf("expected a FULLTEXT suggestion, log was:\n%s", out)
+	}
+	if !strings.Contains(out, "post_title") || !strings.Contains(out, "post_content") {
+		t.Fatalf("FULLTEXT suggestion missing the LIKE columns, log was:\n%s", out)
+	}
+	// It must not also emit a useless B-tree add suggestion for the scan.
+	if strings.Contains(out, "action=add") {
+		t.Fatalf("should not suggest a B-tree index for a leading-wildcard LIKE, log was:\n%s", out)
+	}
+}
+
 func TestSchemaReviewFindsDuplicatesAndUnused(t *testing.T) {
 	log, buf := testLogger()
 	a := newAdvisor(log)
