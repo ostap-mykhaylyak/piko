@@ -97,7 +97,7 @@ func (p *Profiler) Observe(db, query string, dur time.Duration, rows uint64, cac
 	p.dbs[db] = struct{}{}
 	p.mu.Unlock()
 
-	if !cached && p.cfg.SlowQuery > 0 && dur >= p.cfg.SlowQuery {
+	if !cached && p.cfg.SlowQuery > 0 && dur >= p.cfg.SlowQuery.Std() {
 		p.log.Warn("slow query",
 			"duration", dur.Round(time.Millisecond),
 			"db", db,
@@ -109,7 +109,7 @@ func (p *Profiler) Observe(db, query string, dur time.Duration, rows uint64, cac
 // Run emits a report every report_interval until ctx is cancelled, plus a
 // final one on shutdown.
 func (p *Profiler) Run(ctx context.Context) {
-	ticker := time.NewTicker(p.cfg.ReportInterval)
+	ticker := time.NewTicker(p.cfg.ReportInterval.Std())
 	defer ticker.Stop()
 
 	for {
@@ -155,7 +155,7 @@ func (p *Profiler) report(ctx context.Context) {
 		total += st.total
 	}
 	p.log.Info("query report",
-		"interval", p.cfg.ReportInterval,
+		"interval", p.cfg.ReportInterval.Std(),
 		"queries", calls,
 		"distinct", len(stats),
 		"errors", errors,

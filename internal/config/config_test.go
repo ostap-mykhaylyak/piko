@@ -50,15 +50,15 @@ log:
 	if cfg.Pool.MaxOpen != 50 {
 		t.Errorf("pool.max_open = %d, want 50", cfg.Pool.MaxOpen)
 	}
-	if cfg.Pool.PingInterval != 10*time.Second {
-		t.Errorf("pool.ping_interval = %v, want 10s", cfg.Pool.PingInterval)
+	if cfg.Pool.PingInterval.Std() != 10*time.Second {
+		t.Errorf("pool.ping_interval = %v, want 10s", cfg.Pool.PingInterval.Std())
 	}
 	// Defaults survive partial configs.
 	if cfg.Pool.MaxIdle != 10 {
 		t.Errorf("pool.max_idle default = %d, want 10", cfg.Pool.MaxIdle)
 	}
-	if cfg.Pool.AcquireTimeout != 5*time.Second {
-		t.Errorf("pool.acquire_timeout default = %v, want 5s", cfg.Pool.AcquireTimeout)
+	if cfg.Pool.AcquireTimeout.Std() != 5*time.Second {
+		t.Errorf("pool.acquire_timeout default = %v, want 5s", cfg.Pool.AcquireTimeout.Std())
 	}
 	if cfg.Log.Format != "text" {
 		t.Errorf("log format default = %q, want text", cfg.Log.Format)
@@ -110,6 +110,42 @@ listen:
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected error for missing backend")
 	}
+}
+
+// TestDurationParsing covers the values users actually type: units,
+// and the bare 0 that disables a feature (a plain 0 must not be a YAML
+// error, while a unit-less non-zero number must be rejected clearly).
+func TestDurationParsing(t *testing.T) {
+	base := `
+backend:
+  address: "10.0.0.10:3306"
+  username: "piko"
+pool:
+`
+	t.Run("bare zero disables", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, base+"  max_query_time: 0\n"))
+		if err != nil {
+			t.Fatalf("max_query_time: 0 should parse, got %v", err)
+		}
+		if cfg.Pool.MaxQueryTime != 0 {
+			t.Errorf("max_query_time = %v, want 0", cfg.Pool.MaxQueryTime)
+		}
+	})
+	t.Run("unit string", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, base+"  max_query_time: 30s\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Pool.MaxQueryTime.Std() != 30*time.Second {
+			t.Errorf("max_query_time = %v, want 30s", cfg.Pool.MaxQueryTime.Std())
+		}
+	})
+	t.Run("unit-less non-zero rejected", func(t *testing.T) {
+		_, err := Load(writeConfig(t, base+"  max_query_time: 30\n"))
+		if err == nil {
+			t.Fatal("expected error for unit-less duration 30")
+		}
+	})
 }
 
 // valid returns a minimal valid config to mutate in validation tests.

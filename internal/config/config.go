@@ -11,6 +11,37 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Duration is a time.Duration that unmarshals from a YAML string with a
+// unit ("30s", "5m") or from the bare integer 0 to disable a feature.
+// A unit-less non-zero number is rejected with a clear message, because
+// yaml would otherwise reject it cryptically.
+type Duration time.Duration
+
+// Std returns the standard library duration.
+func (d Duration) Std() time.Duration { return time.Duration(d) }
+
+// UnmarshalYAML accepts "30s"-style strings and the bare 0.
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	var s string
+	if err := node.Decode(&s); err == nil {
+		v, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("invalid duration %q: %w", s, err)
+		}
+		*d = Duration(v)
+		return nil
+	}
+	var n int64
+	if err := node.Decode(&n); err != nil {
+		return fmt.Errorf(`duration must be a value with a unit like "30s", or 0`)
+	}
+	if n != 0 {
+		return fmt.Errorf(`duration %d needs a unit: write "%ds" (or 0 to disable)`, n, n)
+	}
+	*d = 0
+	return nil
+}
+
 // Config is the root of config.yaml.
 type Config struct {
 	Listen    Listen    `yaml:"listen"`
@@ -86,12 +117,12 @@ type Pool struct {
 	// PingInterval is how often idle connections (pooled or attached to an
 	// inactive client) receive a COM_PING so MySQL's wait_timeout never
 	// closes them.
-	PingInterval time.Duration `yaml:"ping_interval"`
+	PingInterval Duration `yaml:"ping_interval"`
 	// IdleTimeout closes pooled connections unused for this long (0 = never).
-	IdleTimeout time.Duration `yaml:"idle_timeout"`
+	IdleTimeout Duration `yaml:"idle_timeout"`
 	// AcquireTimeout bounds how long a client waits for a connection when
 	// the pool is exhausted.
-	AcquireTimeout time.Duration `yaml:"acquire_timeout"`
+	AcquireTimeout Duration `yaml:"acquire_timeout"`
 	// Multiplexing releases the backend connection back to the pool between
 	// queries whenever the session state allows it, so many client sessions
 	// share few backend connections. Sessions holding state (transactions,
@@ -103,7 +134,7 @@ type Pool struct {
 	// MaxQueryTime kills backend queries running longer than this
 	// (0 disables it): one runaway query cannot hold a pool connection
 	// hostage forever.
-	MaxQueryTime time.Duration `yaml:"max_query_time"`
+	MaxQueryTime Duration `yaml:"max_query_time"`
 }
 
 // Breaker is the circuit breaker: after Failures consecutive connection
@@ -115,7 +146,7 @@ type Breaker struct {
 	Failures int `yaml:"failures"`
 	// ProbeInterval is how often the backend is probed while the circuit
 	// is open.
-	ProbeInterval time.Duration `yaml:"probe_interval"`
+	ProbeInterval Duration `yaml:"probe_interval"`
 }
 
 // Cache controls the WordPress-aware in-memory query cache.
@@ -129,7 +160,7 @@ type Cache struct {
 	Transients bool `yaml:"transients"`
 	// DefaultTTL is the safety expiry for cached entries; write-driven
 	// invalidation is the primary mechanism.
-	DefaultTTL time.Duration `yaml:"default_ttl"`
+	DefaultTTL Duration `yaml:"default_ttl"`
 	// MaxEntries bounds the number of cached result sets.
 	MaxEntries int `yaml:"max_entries"`
 	// MaxResultBytes skips caching results larger than this.
@@ -147,9 +178,9 @@ type Cache struct {
 type Profiling struct {
 	Enabled bool `yaml:"enabled"`
 	// SlowQuery logs any statement slower than this immediately (0 = off).
-	SlowQuery time.Duration `yaml:"slow_query"`
+	SlowQuery Duration `yaml:"slow_query"`
 	// ReportInterval is how often the aggregated query report is logged.
-	ReportInterval time.Duration `yaml:"report_interval"`
+	ReportInterval Duration `yaml:"report_interval"`
 	// TopQueries is how many queries the report details, heaviest first.
 	TopQueries int `yaml:"top_queries"`
 	// SuggestIndexes runs EXPLAIN on the heaviest queries and inspects the
@@ -176,13 +207,13 @@ func Default() Config {
 		Pool: Pool{
 			MaxOpen:        100,
 			MaxIdle:        10,
-			PingInterval:   30 * time.Second,
-			IdleTimeout:    5 * time.Minute,
-			AcquireTimeout: 5 * time.Second,
+			PingInterval:   Duration(30 * time.Second),
+			IdleTimeout:    Duration(5 * time.Minute),
+			AcquireTimeout: Duration(5 * time.Second),
 			Multiplexing:   true,
 			Breaker: Breaker{
 				Failures:      3,
-				ProbeInterval: 2 * time.Second,
+				ProbeInterval: Duration(2 * time.Second),
 			},
 		},
 		Cache: Cache{
@@ -190,14 +221,14 @@ func Default() Config {
 			TablePrefix:     "wp_",
 			AutoloadOptions: true,
 			Transients:      true,
-			DefaultTTL:      5 * time.Minute,
+			DefaultTTL:      Duration(5 * time.Minute),
 			MaxEntries:      10000,
 			MaxResultBytes:  1 << 20, // 1 MiB
 			Warmup:          true,
 		},
 		Profiling: Profiling{
-			SlowQuery:       500 * time.Millisecond,
-			ReportInterval:  10 * time.Minute,
+			SlowQuery:       Duration(500 * time.Millisecond),
+			ReportInterval:  Duration(10 * time.Minute),
 			TopQueries:      20,
 			SuggestIndexes:  true,
 			SuggestRewrites: true,

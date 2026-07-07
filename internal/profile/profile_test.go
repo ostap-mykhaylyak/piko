@@ -227,7 +227,7 @@ func TestObserveAndSlowLog(t *testing.T) {
 	log, buf := testLogger()
 	cfg := config.Default().Profiling
 	cfg.Enabled = true
-	cfg.SlowQuery = 10 * time.Millisecond
+	cfg.SlowQuery = config.Duration(10 * time.Millisecond)
 	p := New(cfg, nil, log)
 
 	p.Observe("wp", "SELECT * FROM t WHERE id = 1", time.Millisecond, 1, false, nil)

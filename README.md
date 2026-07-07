@@ -77,33 +77,27 @@ configured with a single `config.yaml`.
 
 ## Quick start
 
-On Ubuntu, install the `.deb` from the Releases page — it ships the binary,
-a hardened systemd unit, logrotate configuration, a dedicated `piko` user
-and the default configuration:
+Download the Linux binary from the Releases page and let `--init` install
+everything (it must run as root):
 
 ```sh
-sudo dpkg -i piko_*_amd64.deb
+sudo ./piko --init            # copies itself to /sbin/piko, creates the piko
+                              # user, /etc/piko (config + conf.d), /var/log/piko,
+                              # the systemd unit and logrotate config
 sudo $EDITOR /etc/piko/config.yaml
 sudo systemctl enable --now piko
-sudo systemctl reload piko            # SIGHUP: hot-reloads conf.d rules
+sudo systemctl reload piko    # SIGHUP: hot-reloads conf.d rules
 ```
 
-Or run the plain binary:
-
-```sh
-sudo ./piko --init                    # creates /etc/piko/config.yaml
-                                      # and /etc/piko/conf.d/woocommerce.yaml
-sudo $EDITOR /etc/piko/config.yaml
-sudo ./piko                           # logs to /var/log/piko/piko.log
-```
-
-`-config <path>` overrides the configuration path, both at startup and
-with `--init`.
+`piko --init` **overwrites** everything it manages on every run, so it always
+resets to a known-good install; re-run it to upgrade after downloading a new
+binary. `-config <path>` changes where the config lives (the generated unit
+follows it).
 
 Check a running instance:
 
 ```sh
-piko status                           # clients, pool, breaker, cache stats
+piko status                   # clients, pool, breaker, cache stats
 ```
 
 Point WordPress at piko in `wp-config.php`:
@@ -259,10 +253,10 @@ make test    # unit tests
 
 Every push to `main` runs the tests and builds Linux binaries (amd64 and
 arm64), downloadable as artifacts from the Actions run. Pushing a `v*` tag
-publishes binaries and Ubuntu/Debian `.deb` packages on the Releases page
-via [GoReleaser](https://goreleaser.com/), with checksums. The systemd
-unit, logrotate config and post-install script live in
-[packaging/](packaging/).
+publishes the binaries on the Releases page via
+[GoReleaser](https://goreleaser.com/), with checksums. Install a downloaded
+binary with `sudo ./piko --init` (see Quick start); the systemd unit and
+logrotate config are embedded in the binary.
 
 ## License
 

@@ -10,8 +10,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,13 +29,26 @@ import (
 	"github.com/ostap-mykhaylyak/piko/internal/status"
 )
 
-const defaultConfigPath = "/etc/piko/config.yaml"
+const (
+	defaultConfigPath = "/etc/piko/config.yaml"
+	binaryPath        = "/sbin/piko"
+	servicePath       = "/etc/systemd/system/piko.service"
+	logrotatePath     = "/etc/logrotate.d/piko"
+	logDir            = "/var/log/piko"
+	systemUser        = "piko"
+)
 
 //go:embed config.default.yaml
 var defaultConfig []byte
 
 //go:embed woocommerce.default.yaml
 var defaultWooCommerceRules []byte
+
+//go:embed piko.service
+var serviceUnit string
+
+//go:embed piko.logrotate
+var logrotateConf []byte
 
 // Set at build time via -ldflags (see .goreleaser.yaml / Makefile).
 var (
@@ -42,7 +59,7 @@ var (
 
 func main() {
 	configPath := flag.String("config", defaultConfigPath, "path to the YAML configuration file")
-	initConfig := flag.Bool("init", false, "create a default configuration file at the -config path and exit")
+	initConfig := flag.Bool("init", false, "install piko as a systemd service (binary, config, service, dirs) and exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -52,11 +69,10 @@ func main() {
 	}
 
 	if *initConfig {
-		if err := writeDefaultConfig(*configPath); err != nil {
+		if err := runInit(*configPath); err != nil {
 			fmt.Fprintln(os.Stderr, "piko:", err)
 			os.Exit(1)
 		}
-		fmt.Println("configuration file created:", *configPath)
 		return
 	}
 
@@ -116,31 +132,146 @@ func printStatus(configPath string) error {
 	return nil
 }
 
-// writeDefaultConfig creates the default configuration at path plus the
-// conf.d drop-in directory with the WooCommerce rules, refusing to
-// overwrite existing files. The config is restricted to the owner because
-// it contains credentials.
-func writeDefaultConfig(path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("%s already exists, not overwriting it", path)
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("checking %s: %w", path, err)
+// runInit installs piko as a systemd service, ready to start: it copies the
+// running binary to /sbin/piko, creates the piko system user and the config
+// and log directories, and writes the config, conf.d rules, systemd unit and
+// logrotate config. Everything is overwritten on every run, so `piko --init`
+// always resets to a known-good installation.
+func runInit(configPath string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("--init installs a system service and must run as root (try: sudo piko --init)")
 	}
 
-	confD := filepath.Join(filepath.Dir(path), "conf.d")
+	uid, gid, err := ensureUser(systemUser)
+	if err != nil {
+		return err
+	}
+
+	if err := installBinary(binaryPath); err != nil {
+		return err
+	}
+	fmt.Println("installed binary:", binaryPath)
+
+	// Directories: config (root-owned, readable), logs (piko-owned).
+	confD := filepath.Join(filepath.Dir(configPath), "conf.d")
 	if err := os.MkdirAll(confD, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", confD, err)
 	}
-	if err := os.WriteFile(path, defaultConfig, 0o600); err != nil {
-		return fmt.Errorf("writing %s: %w", path, err)
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return fmt.Errorf("creating %s: %w", logDir, err)
+	}
+	if err := os.Chown(logDir, uid, gid); err != nil {
+		return fmt.Errorf("chown %s: %w", logDir, err)
 	}
 
-	wooPath := filepath.Join(confD, "woocommerce.yaml")
-	if _, err := os.Stat(wooPath); os.IsNotExist(err) {
-		if err := os.WriteFile(wooPath, defaultWooCommerceRules, 0o644); err != nil {
-			return fmt.Errorf("writing %s: %w", wooPath, err)
+	// Config files, overwritten every run.
+	if err := writeFile(configPath, defaultConfig, 0o640); err != nil {
+		return err
+	}
+	if err := os.Chown(configPath, uid, gid); err != nil {
+		return fmt.Errorf("chown %s: %w", configPath, err)
+	}
+	if err := writeFile(filepath.Join(confD, "woocommerce.yaml"), defaultWooCommerceRules, 0o644); err != nil {
+		return err
+	}
+	fmt.Println("wrote configuration:", configPath)
+
+	// systemd unit (ExecStart follows -config) and logrotate.
+	unit := strings.ReplaceAll(serviceUnit, defaultConfigPath, configPath)
+	if err := writeFile(servicePath, []byte(unit), 0o644); err != nil {
+		return err
+	}
+	if err := writeFile(logrotatePath, logrotateConf, 0o644); err != nil {
+		return err
+	}
+	fmt.Println("installed service:", servicePath)
+
+	if err := reloadSystemd(); err != nil {
+		fmt.Fprintln(os.Stderr, "warning:", err)
+	}
+
+	fmt.Println("\nEdit", configPath, "then start piko with:")
+	fmt.Println("  systemctl enable --now piko")
+	return nil
+}
+
+// writeFile writes data to path, replacing any existing file.
+func writeFile(path string, data []byte, perm os.FileMode) error {
+	if err := os.WriteFile(path, data, perm); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	// WriteFile keeps the old mode if the file already existed; enforce it.
+	if err := os.Chmod(path, perm); err != nil {
+		return fmt.Errorf("chmod %s: %w", path, err)
+	}
+	return nil
+}
+
+// installBinary copies the running executable to dst atomically (via a
+// temp file + rename), so overwriting piko while it runs cannot fail with
+// "text file busy".
+func installBinary(dst string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locating the running binary: %w", err)
+	}
+	if self, err = filepath.EvalSymlinks(self); err != nil {
+		return fmt.Errorf("resolving the running binary: %w", err)
+	}
+	data, err := os.ReadFile(self)
+	if err != nil {
+		return fmt.Errorf("reading the running binary: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", filepath.Dir(dst), err)
+	}
+	tmp := dst + ".new"
+	if err := os.WriteFile(tmp, data, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("installing %s: %w", dst, err)
+	}
+	return nil
+}
+
+// ensureUser creates the system user if missing and returns its uid/gid.
+func ensureUser(name string) (int, int, error) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		if _, ok := err.(user.UnknownUserError); !ok {
+			return 0, 0, fmt.Errorf("looking up user %s: %w", name, err)
 		}
-		fmt.Println("cache rules created:", wooPath)
+		cmd := exec.Command("useradd", "--system", "--no-create-home",
+			"--shell", "/usr/sbin/nologin", name)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return 0, 0, fmt.Errorf("creating user %s: %w: %s", name, err, out)
+		}
+		if u, err = user.Lookup(name); err != nil {
+			return 0, 0, fmt.Errorf("looking up new user %s: %w", name, err)
+		}
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parsing uid of %s: %w", name, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parsing gid of %s: %w", name, err)
+	}
+	return uid, gid, nil
+}
+
+// reloadSystemd runs `systemctl daemon-reload`; a missing systemctl (e.g. in
+// a container) is reported but not fatal.
+func reloadSystemd() error {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return fmt.Errorf("systemctl not found, skipping daemon-reload (start piko manually)")
+	}
+	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl daemon-reload failed: %w: %s", err, out)
 	}
 	return nil
 }

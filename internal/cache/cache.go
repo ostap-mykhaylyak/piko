@@ -212,7 +212,7 @@ func (c *Cache) cacheable(db, query string) (time.Duration, []string, string, bo
 	}
 
 	if c.cfg.AutoloadOptions && c.autoloadRe.MatchString(query) {
-		return c.cfg.DefaultTTL, []string{
+		return c.cfg.DefaultTTL.Std(), []string{
 			tagAlloptions(db),
 			tagTable(db, c.optionsTable),
 		}, "alloptions", true
@@ -221,7 +221,7 @@ func (c *Cache) cacheable(db, query string) (time.Duration, []string, string, bo
 	if c.cfg.Transients {
 		if m := c.optionRe.FindStringSubmatch(query); m != nil {
 			if isTransientName(m[1]) {
-				return c.cfg.DefaultTTL, []string{
+				return c.cfg.DefaultTTL.Std(), []string{
 					tagOption(db, m[1]),
 					tagTable(db, c.optionsTable),
 				}, "transients", true
@@ -239,7 +239,7 @@ func (c *Cache) cacheable(db, query string) (time.Duration, []string, string, bo
 		}
 		ttl := r.TTL
 		if ttl <= 0 {
-			ttl = c.cfg.DefaultTTL
+			ttl = c.cfg.DefaultTTL.Std()
 		}
 		tags := make([]string, 0, len(r.InvalidateOn))
 		for _, table := range r.InvalidateOn {

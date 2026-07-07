@@ -60,7 +60,7 @@ pool:
   # Kill backend queries running longer than this (0 disables it), so one
   # runaway query cannot hold a pool connection hostage. KILL QUERY only
   # interrupts the statement; the client gets an error, the session lives.
-  max_query_time: 0
+  max_query_time: 0s
 
 cache:
   # WordPress-aware in-memory query cache with write-driven invalidation.

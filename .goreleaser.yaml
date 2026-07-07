@@ -25,23 +25,6 @@ archives:
       - LICENSE
       - README.md
 
-nfpms:
-  - id: piko-deb
-    package_name: piko
-    formats: [deb]
-    maintainer: Ostap Mykhaylyak <me@ostap.dev>
-    description: MySQL proxy for WordPress and WooCommerce
-    homepage: https://github.com/ostap-mykhaylyak/piko
-    license: MIT
-    bindir: /usr/bin
-    contents:
-      - src: packaging/piko.service
-        dst: /lib/systemd/system/piko.service
-      - src: packaging/piko.logrotate
-        dst: /etc/logrotate.d/piko
-    scripts:
-      postinstall: packaging/postinstall.sh
-
 checksum:
   name_template: checksums.txt
 

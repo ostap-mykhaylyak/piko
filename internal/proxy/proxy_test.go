@@ -143,8 +143,8 @@ func startPikoWith(t *testing.T, backendAddr string, opts pikoOpts) string {
 	poolCfg := config.Pool{
 		MaxOpen:        4,
 		MaxIdle:        4,
-		PingInterval:   opts.pingInterval,
-		AcquireTimeout: 2 * time.Second,
+		PingInterval:   config.Duration(opts.pingInterval),
+		AcquireTimeout: config.Duration(2 * time.Second),
 		Multiplexing:   true,
 	}
 	p, err := pool.New(config.Backend{

@@ -98,9 +98,9 @@ func testPoolConfig() config.Pool {
 	return config.Pool{
 		MaxOpen:        4,
 		MaxIdle:        4,
-		PingInterval:   time.Second,
+		PingInterval:   config.Duration(time.Second),
 		IdleTimeout:    0,
-		AcquireTimeout: 2 * time.Second,
+		AcquireTimeout: config.Duration(2 * time.Second),
 	}
 }
 
@@ -215,7 +215,7 @@ func TestKeepalive(t *testing.T) {
 	}
 
 	cfg := testPoolConfig()
-	cfg.PingInterval = 50 * time.Millisecond
+	cfg.PingInterval = config.Duration(50 * time.Millisecond)
 	p := newTestPool(t, addr, cfg, dialer)
 
 	c, err := p.Acquire(context.Background())
@@ -268,8 +268,8 @@ func TestCircuitBreaker(t *testing.T) {
 	ln.Close()
 
 	cfg := testPoolConfig()
-	cfg.AcquireTimeout = 500 * time.Millisecond
-	cfg.Breaker = config.Breaker{Failures: 3, ProbeInterval: 50 * time.Millisecond}
+	cfg.AcquireTimeout = config.Duration(500 * time.Millisecond)
+	cfg.Breaker = config.Breaker{Failures: 3, ProbeInterval: config.Duration(50 * time.Millisecond)}
 	p := newTestPool(t, addr, cfg, nil)
 
 	// Enough failures to trip the breaker.
@@ -350,7 +350,7 @@ func TestMaxOpen(t *testing.T) {
 	cfg := testPoolConfig()
 	cfg.MaxOpen = 1
 	cfg.MaxIdle = 1
-	cfg.AcquireTimeout = 100 * time.Millisecond
+	cfg.AcquireTimeout = config.Duration(100 * time.Millisecond)
 	p := newTestPool(t, addr, cfg, nil)
 
 	c1, err := p.Acquire(context.Background())

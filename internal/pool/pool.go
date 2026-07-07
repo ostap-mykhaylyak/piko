@@ -137,7 +137,7 @@ func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 		return nil, ErrBackendDown
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, p.cfg.AcquireTimeout)
+	ctx, cancel := context.WithTimeout(ctx, p.cfg.AcquireTimeout.Std())
 	defer cancel()
 
 	for {
@@ -318,7 +318,7 @@ func (p *Pool) recordDialFailure() {
 
 // probe retries the backend until it answers, then closes the circuit.
 func (p *Pool) probe() {
-	ticker := time.NewTicker(p.cfg.Breaker.ProbeInterval)
+	ticker := time.NewTicker(p.cfg.Breaker.ProbeInterval.Std())
 	defer ticker.Stop()
 
 	for {
@@ -328,7 +328,7 @@ func (p *Pool) probe() {
 		case <-ticker.C:
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), p.cfg.Breaker.ProbeInterval)
+		ctx, cancel := context.WithTimeout(context.Background(), p.cfg.Breaker.ProbeInterval.Std())
 		c, err := client.ConnectWithDialer(ctx, "tcp", p.backend.Address,
 			p.backend.Username, p.backend.Password, "", p.dialer, p.dialOptions()...)
 		cancel()
@@ -349,7 +349,7 @@ func (p *Pool) probe() {
 // revive validates a connection popped from the pool. Connections pinged
 // recently by the keepalive loop are trusted; stale ones get a fresh ping.
 func (p *Pool) revive(c *Conn) bool {
-	if time.Since(c.lastPing) < 2*p.cfg.PingInterval {
+	if time.Since(c.lastPing) < 2*p.cfg.PingInterval.Std() {
 		return true
 	}
 	if err := c.Ping(); err != nil {
@@ -409,7 +409,7 @@ func (p *Pool) reset(c *Conn) error {
 // keepalive pings idle pooled connections so MySQL never closes them for
 // inactivity, and closes connections idle beyond idle_timeout.
 func (p *Pool) keepalive() {
-	ticker := time.NewTicker(p.cfg.PingInterval)
+	ticker := time.NewTicker(p.cfg.PingInterval.Std())
 	defer ticker.Stop()
 
 	for {
@@ -428,12 +428,12 @@ func (p *Pool) keepalive() {
 				continue
 			}
 
-			if p.cfg.IdleTimeout > 0 && time.Since(c.pooledAt) > p.cfg.IdleTimeout {
+			if p.cfg.IdleTimeout > 0 && time.Since(c.pooledAt) > p.cfg.IdleTimeout.Std() {
 				p.log.Debug("closing pooled connection, idle timeout reached")
 				p.Discard(c)
 				continue
 			}
-			if time.Since(c.lastPing) >= p.cfg.PingInterval {
+			if time.Since(c.lastPing) >= p.cfg.PingInterval.Std() {
 				if err := c.Ping(); err != nil {
 					p.log.Warn("pooled connection lost, dropping it", "error", err)
 					p.Discard(c)

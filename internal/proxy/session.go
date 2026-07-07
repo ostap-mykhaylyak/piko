@@ -304,7 +304,7 @@ func isConnError(err error) bool {
 // idle, sending COM_PING every ping_interval.
 func (s *session) pinger() {
 	defer close(s.pingDone)
-	ticker := time.NewTicker(s.cfg.PingInterval)
+	ticker := time.NewTicker(s.cfg.PingInterval.Std())
 	defer ticker.Stop()
 
 	for {
@@ -315,7 +315,7 @@ func (s *session) pinger() {
 		}
 
 		s.mu.Lock()
-		if s.conn != nil && time.Since(s.lastUse) >= s.cfg.PingInterval {
+		if s.conn != nil && time.Since(s.lastUse) >= s.cfg.PingInterval.Std() {
 			if err := s.conn.Ping(); err != nil {
 				s.log.Warn("keepalive ping failed, dropping backend connection", "error", err)
 				s.pool.Discard(s.conn)
@@ -420,7 +420,7 @@ func (s *session) queryWatchdog(c *pool.Conn, query string) func() {
 		return func() {}
 	}
 	threadID := c.ThreadID
-	limit := s.cfg.MaxQueryTime
+	limit := s.cfg.MaxQueryTime.Std()
 	timer := time.AfterFunc(limit, func() {
 		s.log.Warn("query exceeded max_query_time, killing it",
 			"max_query_time", limit, "query", query)
