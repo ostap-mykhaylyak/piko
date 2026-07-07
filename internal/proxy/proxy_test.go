@@ -449,15 +449,31 @@ func TestQueryRewrite(t *testing.T) {
 	}
 }
 
+// connectRetry keeps trying to connect until the deadline; needed where a
+// just-closed connection may still hold its client slot for a moment.
+func connectRetry(t *testing.T, addr string) *client.Conn {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c, err := client.Connect(addr, "wordpress", "apppass", "wp")
+		if err == nil {
+			return c
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connect never succeeded: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestMaxClientConnections: connections beyond the cap are refused.
 func TestMaxClientConnections(t *testing.T) {
 	backendAddr, _ := startFakeMySQL(t, "piko", "backendpass")
 	pikoAddr := startPikoWith(t, backendAddr, pikoOpts{maxClients: 1})
 
-	a, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Retry: the listener probe inside startPikoWith may still hold the
+	// only client slot for an instant.
+	a := connectRetry(t, pikoAddr)
 	defer a.Close()
 
 	if b, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp"); err == nil {
@@ -467,18 +483,7 @@ func TestMaxClientConnections(t *testing.T) {
 
 	// Closing the first frees a slot.
 	a.Close()
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		c, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
-		if err == nil {
-			c.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("connection still rejected after slot freed: %v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	connectRetry(t, pikoAddr).Close()
 }
 
 // TestAuthRejected: wrong client credentials must not reach the backend.
