@@ -12,6 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ostap-mykhaylyak/piko/internal/firewall"
 	"github.com/ostap-mykhaylyak/piko/internal/rewrite"
 )
 
@@ -27,12 +28,20 @@ type Rule struct {
 	re *regexp.Regexp
 }
 
-// ruleFile is the schema of a conf.d drop-in: cache rules plus query
-// rewrites.
+// ruleFile is the schema of a conf.d drop-in: cache rules, query rewrites
+// and firewall blocks.
 type ruleFile struct {
-	Name     string         `yaml:"name"`
-	Rules    []Rule         `yaml:"rules"`
-	Rewrites []rewrite.Rule `yaml:"rewrites"`
+	Name     string          `yaml:"name"`
+	Rules    []Rule          `yaml:"rules"`
+	Rewrites []rewrite.Rule  `yaml:"rewrites"`
+	Block    []firewall.Rule `yaml:"block"`
+}
+
+// RuleSet is everything the conf.d drop-ins declare.
+type RuleSet struct {
+	Cache    []Rule
+	Rewrites []rewrite.Rule
+	Blocks   []firewall.Rule
 }
 
 // LoadRuleDir loads and compiles every *.yaml/*.yml file in dir, in
@@ -40,13 +49,15 @@ type ruleFile struct {
 // lists expands to tablePrefix, so shipped rules work with any WordPress
 // $table_prefix. A missing directory is not an error: it just means no
 // extra rules.
-func LoadRuleDir(dir, tablePrefix string) ([]Rule, []rewrite.Rule, error) {
+func LoadRuleDir(dir, tablePrefix string) (RuleSet, error) {
+	var set RuleSet
+
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return nil, nil, nil
+		return set, nil
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading rules directory: %w", err)
+		return set, fmt.Errorf("reading rules directory: %w", err)
 	}
 
 	var files []string
@@ -61,18 +72,17 @@ func LoadRuleDir(dir, tablePrefix string) ([]Rule, []rewrite.Rule, error) {
 	}
 	sort.Strings(files)
 
-	var rules []Rule
-	var rewrites []rewrite.Rule
 	for _, name := range files {
 		path := filepath.Join(dir, name)
 		f, err := loadRuleFile(path, tablePrefix)
 		if err != nil {
-			return nil, nil, err
+			return set, err
 		}
-		rules = append(rules, f.Rules...)
-		rewrites = append(rewrites, f.Rewrites...)
+		set.Cache = append(set.Cache, f.Rules...)
+		set.Rewrites = append(set.Rewrites, f.Rewrites...)
+		set.Blocks = append(set.Blocks, f.Block...)
 	}
-	return rules, rewrites, nil
+	return set, nil
 }
 
 func loadRuleFile(path, tablePrefix string) (*ruleFile, error) {
@@ -112,6 +122,12 @@ func loadRuleFile(path, tablePrefix string) (*ruleFile, error) {
 		f.Rewrites[i].Replace = expand(f.Rewrites[i].Replace)
 		if err := f.Rewrites[i].Compile(); err != nil {
 			return nil, fmt.Errorf("%s: rewrites[%d]: %w", path, i, err)
+		}
+	}
+	for i := range f.Block {
+		f.Block[i].Match = expand(f.Block[i].Match)
+		if err := f.Block[i].Compile(); err != nil {
+			return nil, fmt.Errorf("%s: block[%d]: %w", path, i, err)
 		}
 	}
 	return &f, nil

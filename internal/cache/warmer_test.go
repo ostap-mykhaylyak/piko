@@ -69,9 +69,12 @@ func TestWarmer(t *testing.T) {
 	}()
 
 	log := slog.New(slog.DiscardHandler)
-	p := pool.New(config.Backend{Address: ln.Addr().String(), Username: "piko", Password: "secret"},
+	p, err := pool.New(config.Backend{Address: ln.Addr().String(), Username: "piko", Password: "secret"},
 		config.Pool{MaxOpen: 2, MaxIdle: 2, PingInterval: time.Second, AcquireTimeout: 2 * time.Second},
 		log, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(p.Close)
 
 	c := testCache(t, nil)

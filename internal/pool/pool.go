@@ -9,10 +9,13 @@ package pool
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +39,9 @@ type Conn struct {
 	BoundDB string
 	VarSig  string
 
+	// ThreadID is MySQL's connection id, used by KILL QUERY.
+	ThreadID uint32
+
 	pooledAt time.Time // when it was released to the pool
 	lastPing time.Time // last successful COM_PING or command
 }
@@ -45,6 +51,7 @@ type Pool struct {
 	backend config.Backend
 	cfg     config.Pool
 	dialer  Dialer
+	tlsConf *tls.Config // nil = plaintext backend connections
 	log     *slog.Logger
 
 	// openSem holds one token per open backend connection (leased or idle).
@@ -70,22 +77,54 @@ var ErrBackendDown = errors.New("backend unavailable (circuit breaker open)")
 
 // New creates the pool and starts its keepalive loop.
 // A nil dialer means plain TCP.
-func New(backend config.Backend, cfg config.Pool, log *slog.Logger, dialer Dialer) *Pool {
+func New(backend config.Backend, cfg config.Pool, log *slog.Logger, dialer Dialer) (*Pool, error) {
 	if dialer == nil {
 		d := &net.Dialer{Timeout: 5 * time.Second}
 		dialer = d.DialContext
+	}
+	tlsConf, err := backendTLS(backend)
+	if err != nil {
+		return nil, err
 	}
 	p := &Pool{
 		backend: backend,
 		cfg:     cfg,
 		dialer:  dialer,
+		tlsConf: tlsConf,
 		log:     log,
 		openSem: make(chan struct{}, cfg.MaxOpen),
 		idle:    make(chan *Conn, cfg.MaxOpen),
 		stop:    make(chan struct{}),
 	}
 	go p.keepalive()
-	return p
+	return p, nil
+}
+
+// backendTLS builds the TLS configuration for backend connections.
+func backendTLS(backend config.Backend) (*tls.Config, error) {
+	if !backend.TLS.Enabled {
+		return nil, nil
+	}
+	host, _, err := net.SplitHostPort(backend.Address)
+	if err != nil {
+		return nil, fmt.Errorf("backend.address: %w", err)
+	}
+	conf := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: backend.TLS.SkipVerify,
+	}
+	if backend.TLS.CA != "" {
+		pem, err := os.ReadFile(backend.TLS.CA)
+		if err != nil {
+			return nil, fmt.Errorf("reading backend.tls.ca: %w", err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("backend.tls.ca %s: no certificates found", backend.TLS.CA)
+		}
+		conf.RootCAs = roots
+	}
+	return conf, nil
 }
 
 // Acquire returns a backend connection: a pooled idle one when available,
@@ -203,14 +242,60 @@ func (p *Pool) Close() {
 
 func (p *Pool) dial(ctx context.Context) (*Conn, error) {
 	c, err := client.ConnectWithDialer(ctx, "tcp", p.backend.Address,
-		p.backend.Username, p.backend.Password, "", p.dialer)
+		p.backend.Username, p.backend.Password, "", p.dialer, p.dialOptions()...)
 	if err != nil {
 		p.recordDialFailure()
 		return nil, fmt.Errorf("connecting to backend %s: %w", p.backend.Address, err)
 	}
 	p.breakerFails.Store(0)
 	now := time.Now()
-	return &Conn{Conn: c, pooledAt: now, lastPing: now}, nil
+	return &Conn{Conn: c, ThreadID: c.GetConnectionID(), pooledAt: now, lastPing: now}, nil
+}
+
+func (p *Pool) dialOptions() []client.Option {
+	if p.tlsConf == nil {
+		return nil
+	}
+	return []client.Option{func(c *client.Conn) error {
+		c.SetTLSConfig(p.tlsConf)
+		return nil
+	}}
+}
+
+// KillQuery interrupts a running backend query (KILL QUERY leaves the
+// connection alive) using a dedicated throwaway connection, so it works
+// even when the pool is saturated by stuck queries.
+func (p *Pool) KillQuery(threadID uint32) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c, err := client.ConnectWithDialer(ctx, "tcp", p.backend.Address,
+		p.backend.Username, p.backend.Password, "", p.dialer, p.dialOptions()...)
+	if err != nil {
+		return fmt.Errorf("connecting to kill query: %w", err)
+	}
+	defer c.Close()
+
+	_, err = c.Execute(fmt.Sprintf("KILL QUERY %d", threadID))
+	return err
+}
+
+// Stats is a snapshot of the pool state.
+type Stats struct {
+	Open        int  `json:"open"`
+	Idle        int  `json:"idle"`
+	MaxOpen     int  `json:"max_open"`
+	BreakerOpen bool `json:"breaker_open"`
+}
+
+// Stat returns the current pool state.
+func (p *Pool) Stat() Stats {
+	return Stats{
+		Open:        len(p.openSem),
+		Idle:        len(p.idle),
+		MaxOpen:     p.cfg.MaxOpen,
+		BreakerOpen: p.breakerOpen.Load(),
+	}
 }
 
 // recordDialFailure counts consecutive dial failures and opens the circuit
@@ -245,7 +330,7 @@ func (p *Pool) probe() {
 
 		ctx, cancel := context.WithTimeout(context.Background(), p.cfg.Breaker.ProbeInterval)
 		c, err := client.ConnectWithDialer(ctx, "tcp", p.backend.Address,
-			p.backend.Username, p.backend.Password, "", p.dialer)
+			p.backend.Username, p.backend.Password, "", p.dialer, p.dialOptions()...)
 		cancel()
 		if err != nil {
 			p.log.Debug("backend probe failed", "error", err)

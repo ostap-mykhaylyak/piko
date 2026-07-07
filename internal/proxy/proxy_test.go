@@ -16,6 +16,7 @@ import (
 
 	"github.com/ostap-mykhaylyak/piko/internal/cache"
 	"github.com/ostap-mykhaylyak/piko/internal/config"
+	"github.com/ostap-mykhaylyak/piko/internal/firewall"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
 	"github.com/ostap-mykhaylyak/piko/internal/rewrite"
 )
@@ -123,6 +124,7 @@ type pikoOpts struct {
 	dialer       pool.Dialer
 	cache        *cache.Cache
 	rewriter     *rewrite.Rewriter
+	firewall     *firewall.Firewall
 	maxClients   int
 }
 
@@ -145,9 +147,12 @@ func startPikoWith(t *testing.T, backendAddr string, opts pikoOpts) string {
 		AcquireTimeout: 2 * time.Second,
 		Multiplexing:   true,
 	}
-	p := pool.New(config.Backend{
+	p, err := pool.New(config.Backend{
 		Address: backendAddr, Username: "piko", Password: "backendpass",
 	}, poolCfg, log, opts.dialer)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(p.Close)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -165,6 +170,7 @@ func startPikoWith(t *testing.T, backendAddr string, opts pikoOpts) string {
 		Pool:     p,
 		Cache:    opts.cache,
 		Rewriter: opts.rewriter,
+		Firewall: opts.firewall,
 		Log:      log,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -419,6 +425,39 @@ func TestTempTablePins(t *testing.T) {
 
 	if got := counters.accepted.Load(); got != 2 {
 		t.Errorf("backend saw %d connections with a temp-table session, want 2", got)
+	}
+}
+
+// TestFirewallBlock: a blocked query is rejected without reaching the
+// backend.
+func TestFirewallBlock(t *testing.T) {
+	backendAddr, counters := startFakeMySQL(t, "piko", "backendpass")
+
+	fw, err := firewall.New([]firewall.Rule{
+		{Name: "no-bigtable", Match: `(?i)FROM\s+wp_bigtable`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pikoAddr := startPikoWith(t, backendAddr, pikoOpts{firewall: fw})
+
+	conn, err := client.Connect(pikoAddr, "wordpress", "apppass", "wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	before := counters.queries.Load()
+	if _, err := conn.Execute("SELECT * FROM wp_bigtable"); err == nil {
+		t.Fatal("expected the blocked query to error")
+	}
+	if got := counters.queries.Load(); got != before {
+		t.Errorf("blocked query reached the backend (%d queries)", got-before)
+	}
+
+	// A non-blocked query still works on the same session.
+	if _, err := conn.Execute("SELECT 42"); err != nil {
+		t.Fatalf("allowed query failed: %v", err)
 	}
 }
 

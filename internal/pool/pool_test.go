@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 type fakeCounters struct {
 	accepted atomic.Int64
 	resets   atomic.Int64 // COM_RESET_CONNECTION commands received
+	kills    atomic.Int64 // KILL QUERY statements received
 }
 
 // fakeHandler answers every query with a single-value resultset and accepts
@@ -26,7 +28,11 @@ type fakeCounters struct {
 type fakeHandler struct{ counters *fakeCounters }
 
 func (fakeHandler) UseDB(string) error { return nil }
-func (fakeHandler) HandleQuery(string) (*mysql.Result, error) {
+func (h fakeHandler) HandleQuery(query string) (*mysql.Result, error) {
+	if strings.HasPrefix(strings.ToUpper(query), "KILL QUERY") {
+		h.counters.kills.Add(1)
+		return &mysql.Result{}, nil
+	}
 	rs, err := mysql.BuildSimpleTextResultset([]string{"v"}, [][]any{{int64(1)}})
 	if err != nil {
 		return nil, err
@@ -100,8 +106,11 @@ func testPoolConfig() config.Pool {
 
 func newTestPool(t *testing.T, addr string, cfg config.Pool, dialer Dialer) *Pool {
 	t.Helper()
-	p := New(config.Backend{Address: addr, Username: "piko", Password: "secret"},
+	p, err := New(config.Backend{Address: addr, Username: "piko", Password: "secret"},
 		cfg, slog.New(slog.DiscardHandler), dialer)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(p.Close)
 	return p
 }
@@ -231,6 +240,19 @@ func TestKeepalive(t *testing.T) {
 	defer p.Release(c2)
 	if _, err := c2.Execute("SELECT 1"); err != nil {
 		t.Fatalf("query after keepalive: %v", err)
+	}
+}
+
+// TestKillQuery: KillQuery opens a fresh connection and issues KILL QUERY.
+func TestKillQuery(t *testing.T) {
+	addr, counters := startFakeMySQL(t, "piko", "secret")
+	p := newTestPool(t, addr, testPoolConfig(), nil)
+
+	if err := p.KillQuery(1234); err != nil {
+		t.Fatalf("KillQuery: %v", err)
+	}
+	if got := counters.kills.Load(); got != 1 {
+		t.Errorf("backend saw %d KILL QUERY, want 1", got)
 	}
 }
 

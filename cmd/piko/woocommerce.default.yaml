@@ -55,3 +55,12 @@ rules:
 #   - name: remove-sql-calc-found-rows
 #     match: "(?i)SQL_CALC_FOUND_ROWS\\s+"
 #     replace: ""
+
+# Query firewall: block queries matching a pattern with a clean MySQL error
+# before they reach the backend. The emergency brake for a runaway plugin
+# query: add the rule and `systemctl reload piko`, no restart. {prefix}
+# expands to the table prefix.
+#
+# block:
+#   - name: block-expensive-report
+#     match: "(?i)FROM {prefix}postmeta.*FROM {prefix}postmeta"

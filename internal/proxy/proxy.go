@@ -8,6 +8,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"net"
 	"sync"
@@ -18,13 +19,14 @@ import (
 
 	"github.com/ostap-mykhaylyak/piko/internal/cache"
 	"github.com/ostap-mykhaylyak/piko/internal/config"
+	"github.com/ostap-mykhaylyak/piko/internal/firewall"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
 	"github.com/ostap-mykhaylyak/piko/internal/profile"
 	"github.com/ostap-mykhaylyak/piko/internal/rewrite"
 )
 
-// Options wires the Server's collaborators; Cache, Profiler and Rewriter
-// are optional.
+// Options wires the Server's collaborators; Cache, Profiler, Rewriter,
+// Firewall and TLS are optional.
 type Options struct {
 	Listen   config.Listen
 	Users    []config.User
@@ -33,6 +35,8 @@ type Options struct {
 	Cache    *cache.Cache
 	Profiler *profile.Profiler
 	Rewriter *rewrite.Rewriter
+	Firewall *firewall.Firewall
+	TLS      *tls.Config // client-facing TLS, advertised when non-nil
 	Log      *slog.Logger
 }
 
@@ -42,9 +46,10 @@ type Server struct {
 	maxClients int
 	pool       *pool.Pool
 	cfg        config.Pool
-	cache      *cache.Cache      // nil when disabled
-	prof       *profile.Profiler // nil when disabled
-	rewriter   *rewrite.Rewriter // nil when disabled
+	cache      *cache.Cache       // nil when disabled
+	prof       *profile.Profiler  // nil when disabled
+	rewriter   *rewrite.Rewriter  // nil when disabled
+	firewall   *firewall.Firewall // nil when disabled
 	log        *slog.Logger
 
 	srvConf *server.Server
@@ -53,6 +58,7 @@ type Server struct {
 	wg         sync.WaitGroup
 	clients    sync.Map // net.Conn -> struct{}, open client sockets
 	numClients atomic.Int64
+	numPinned  atomic.Int64
 }
 
 // New creates a Server; call Run to start serving.
@@ -60,7 +66,7 @@ func New(o Options) *Server {
 	// mysql_native_password keeps compatibility with every PHP/mysqli and
 	// mysqlnd version WordPress runs on.
 	srvConf := server.NewServer("8.0.36-piko", mysql.DEFAULT_COLLATION_ID,
-		mysql.AUTH_NATIVE_PASSWORD, nil, nil)
+		mysql.AUTH_NATIVE_PASSWORD, nil, o.TLS)
 	auth := server.NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
 	for _, u := range o.Users {
 		// AddUser only fails for unknown auth plugins, which is fixed here.
@@ -75,9 +81,24 @@ func New(o Options) *Server {
 		cache:      o.Cache,
 		prof:       o.Profiler,
 		rewriter:   o.Rewriter,
+		firewall:   o.Firewall,
 		log:        o.Log,
 		srvConf:    srvConf,
 		auth:       auth,
+	}
+}
+
+// Stats is a snapshot of the client side.
+type Stats struct {
+	Clients int64 `json:"clients"`
+	Pinned  int64 `json:"pinned_sessions"`
+}
+
+// Stat returns the current client-side state.
+func (s *Server) Stat() Stats {
+	return Stats{
+		Clients: s.numClients.Load(),
+		Pinned:  s.numPinned.Load(),
 	}
 }
 

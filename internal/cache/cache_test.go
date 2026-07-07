@@ -206,34 +206,41 @@ rules:
 		t.Fatal(err)
 	}
 
-	rules, rewrites, err := LoadRuleDir(dir, "wp_")
+	set, err := LoadRuleDir(dir, "wp_")
 	if err != nil {
 		t.Fatalf("LoadRuleDir: %v", err)
 	}
-	if len(rules) != 1 || rules[0].Name != "r1" || rules[0].re == nil {
-		t.Fatalf("rules = %+v", rules)
+	if len(set.Cache) != 1 || set.Cache[0].Name != "r1" || set.Cache[0].re == nil {
+		t.Fatalf("rules = %+v", set.Cache)
 	}
-	if len(rewrites) != 0 {
-		t.Fatalf("rewrites = %+v, want none", rewrites)
+	if len(set.Rewrites) != 0 || len(set.Blocks) != 0 {
+		t.Fatalf("rewrites/blocks = %+v/%+v, want none", set.Rewrites, set.Blocks)
 	}
 
-	// A file with rewrites loads them too.
-	withRewrites := `
+	// A file with rewrites and blocks loads them too.
+	withExtras := `
 rewrites:
   - name: no-rand
     match: "(?i)\\s*ORDER\\s+BY\\s+RAND\\(\\)"
     replace: ""
+block:
+  - name: no-report
+    match: "^SELECT .* FROM {prefix}bigtable"
 `
-	if err := os.WriteFile(filepath.Join(dir, "15-rw.yaml"), []byte(withRewrites), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "15-rw.yaml"), []byte(withExtras), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, rewrites, err = LoadRuleDir(dir, "wp_"); err != nil || len(rewrites) != 1 {
-		t.Fatalf("rewrites = %+v (err %v), want 1", rewrites, err)
+	set, err = LoadRuleDir(dir, "wp_")
+	if err != nil || len(set.Rewrites) != 1 || len(set.Blocks) != 1 {
+		t.Fatalf("rewrites/blocks = %+v/%+v (err %v), want 1/1", set.Rewrites, set.Blocks, err)
+	}
+	if set.Blocks[0].Match != "^SELECT .* FROM wp_bigtable" {
+		t.Fatalf("block match not prefix-expanded: %q", set.Blocks[0].Match)
 	}
 
 	// Missing directory is fine.
-	if rules, _, err := LoadRuleDir(filepath.Join(dir, "missing"), "wp_"); err != nil || rules != nil {
-		t.Fatalf("missing dir: rules=%v err=%v", rules, err)
+	if set, err := LoadRuleDir(filepath.Join(dir, "missing"), "wp_"); err != nil || set.Cache != nil {
+		t.Fatalf("missing dir: rules=%v err=%v", set.Cache, err)
 	}
 
 	// Broken regex is an error.
@@ -241,7 +248,7 @@ rewrites:
 	if err := os.WriteFile(filepath.Join(dir, "20-bad.yaml"), []byte(bad), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := LoadRuleDir(dir, "wp_"); err == nil {
+	if _, err := LoadRuleDir(dir, "wp_"); err == nil {
 		t.Fatal("expected error for invalid regex")
 	}
 }
@@ -265,18 +272,18 @@ rewrites:
 		t.Fatal(err)
 	}
 
-	rules, rewrites, err := LoadRuleDir(dir, "shop_")
+	set, err := LoadRuleDir(dir, "shop_")
 	if err != nil {
 		t.Fatalf("LoadRuleDir: %v", err)
 	}
-	if rules[0].Match != `^SELECT \* FROM shop_postmeta$` {
-		t.Errorf("match = %q", rules[0].Match)
+	if set.Cache[0].Match != `^SELECT \* FROM shop_postmeta$` {
+		t.Errorf("match = %q", set.Cache[0].Match)
 	}
-	if rules[0].InvalidateOn[0] != "shop_postmeta" {
-		t.Errorf("invalidate_on = %v", rules[0].InvalidateOn)
+	if set.Cache[0].InvalidateOn[0] != "shop_postmeta" {
+		t.Errorf("invalidate_on = %v", set.Cache[0].InvalidateOn)
 	}
-	if rewrites[0].Match != "FROM shop_big" || rewrites[0].Replace != "FROM shop_small" {
-		t.Errorf("rewrite = %+v", rewrites[0])
+	if set.Rewrites[0].Match != "FROM shop_big" || set.Rewrites[0].Replace != "FROM shop_small" {
+		t.Errorf("rewrite = %+v", set.Rewrites[0])
 	}
 }
 

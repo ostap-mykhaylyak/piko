@@ -19,7 +19,14 @@ type Config struct {
 	Pool      Pool      `yaml:"pool"`
 	Cache     Cache     `yaml:"cache"`
 	Profiling Profiling `yaml:"profiling"`
+	Status    Status    `yaml:"status"`
 	Log       Log       `yaml:"log"`
+}
+
+// Status exposes runtime state to the `piko status` command over a local
+// unix socket. Empty disables it.
+type Status struct {
+	Socket string `yaml:"socket"`
 }
 
 // Listen configures the client-facing listener.
@@ -29,14 +36,37 @@ type Listen struct {
 	// connections beyond the cap are closed immediately instead of piling
 	// up behind a saturated backend.
 	MaxConnections int `yaml:"max_connections"`
+	// TLS enables encrypted client connections when both files are set.
+	TLS ListenTLS `yaml:"tls"`
 }
+
+// ListenTLS holds the server certificate for client-facing TLS.
+type ListenTLS struct {
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
+}
+
+// Enabled reports whether client-facing TLS is configured.
+func (t ListenTLS) Enabled() bool { return t.Cert != "" || t.Key != "" }
 
 // Backend is the MySQL server piko forwards to. Username and password are
 // piko's own credentials: backend connections belong to piko, not to clients.
 type Backend struct {
-	Address  string `yaml:"address"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	Address  string     `yaml:"address"`
+	Username string     `yaml:"username"`
+	Password string     `yaml:"password"`
+	TLS      BackendTLS `yaml:"tls"`
+}
+
+// BackendTLS encrypts connections toward MySQL.
+type BackendTLS struct {
+	Enabled bool `yaml:"enabled"`
+	// CA is an optional custom certificate authority (PEM). Empty uses the
+	// system roots.
+	CA string `yaml:"ca"`
+	// SkipVerify accepts any server certificate (encryption without
+	// authentication); for self-signed setups.
+	SkipVerify bool `yaml:"skip_verify"`
 }
 
 // User is an account that clients (e.g. WordPress) use to authenticate
@@ -70,6 +100,10 @@ type Pool struct {
 	Multiplexing bool `yaml:"multiplexing"`
 	// Breaker protects against a dead or unreachable backend.
 	Breaker Breaker `yaml:"breaker"`
+	// MaxQueryTime kills backend queries running longer than this
+	// (0 disables it): one runaway query cannot hold a pool connection
+	// hostage forever.
+	MaxQueryTime time.Duration `yaml:"max_query_time"`
 }
 
 // Breaker is the circuit breaker: after Failures consecutive connection
@@ -168,7 +202,8 @@ func Default() Config {
 			SuggestIndexes:  true,
 			SuggestRewrites: true,
 		},
-		Log: Log{Level: "info", Format: "text", Path: "/var/log/piko"},
+		Status: Status{Socket: "/run/piko/status.sock"},
+		Log:    Log{Level: "info", Format: "text", Path: "/var/log/piko"},
 	}
 }
 
@@ -244,6 +279,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Listen.MaxConnections < 0 {
 		return fmt.Errorf("listen.max_connections must be >= 0 (0 = unlimited)")
+	}
+	if c.Listen.TLS.Enabled() && (c.Listen.TLS.Cert == "" || c.Listen.TLS.Key == "") {
+		return fmt.Errorf("listen.tls needs both cert and key")
+	}
+	if c.Pool.MaxQueryTime < 0 {
+		return fmt.Errorf("pool.max_query_time must be >= 0 (0 disables it)")
 	}
 	if c.Cache.Enabled {
 		if c.Cache.TablePrefix == "" {

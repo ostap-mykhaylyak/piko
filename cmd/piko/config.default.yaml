@@ -7,6 +7,10 @@ listen:
   # Cap on concurrent client connections (0 = unlimited). Connections
   # beyond the cap are refused immediately instead of piling up.
   max_connections: 0
+  # Encrypt client connections (both files required to enable).
+  # tls:
+  #   cert: /etc/piko/server.crt
+  #   key: /etc/piko/server.key
 
 backend:
   # The MySQL server piko forwards to. Backend connections belong to piko
@@ -14,6 +18,11 @@ backend:
   address: "10.0.0.10:3306"
   username: "wordpress"
   password: "change-me"
+  # Encrypt connections toward MySQL (for a remote database).
+  # tls:
+  #   enabled: true
+  #   ca: /etc/piko/mysql-ca.pem   # optional; omit to use the system roots
+  #   skip_verify: false           # true accepts self-signed certs
 
 # Optional: accounts that clients (WordPress) use to authenticate against
 # piko. MySQL never sees these — they only exist between the application and
@@ -48,6 +57,10 @@ pool:
   breaker:
     failures: 3
     probe_interval: 2s
+  # Kill backend queries running longer than this (0 disables it), so one
+  # runaway query cannot hold a pool connection hostage. KILL QUERY only
+  # interrupts the statement; the client gets an error, the session lives.
+  max_query_time: 0
 
 cache:
   # WordPress-aware in-memory query cache with write-driven invalidation.
@@ -93,6 +106,11 @@ profiling:
   # SQL_CALC_FOUND_ROWS, leading-wildcard LIKE, large OFFSET) and log the
   # conf.d rewrite rule ready to configure.
   suggest_rewrites: true
+
+status:
+  # Local unix socket exposing runtime state to `piko status` (read-only).
+  # Empty disables it.
+  socket: /run/piko/status.sock
 
 log:
   level: info           # debug | info | warn | error

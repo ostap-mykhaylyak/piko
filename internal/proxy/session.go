@@ -13,6 +13,7 @@ import (
 
 	"github.com/ostap-mykhaylyak/piko/internal/cache"
 	"github.com/ostap-mykhaylyak/piko/internal/config"
+	"github.com/ostap-mykhaylyak/piko/internal/firewall"
 	"github.com/ostap-mykhaylyak/piko/internal/pool"
 	"github.com/ostap-mykhaylyak/piko/internal/profile"
 	"github.com/ostap-mykhaylyak/piko/internal/rewrite"
@@ -45,11 +46,13 @@ const maxTrackedSets = 20
 // transparently attaches a fresh one from the pool.
 type session struct {
 	ctx      context.Context
+	srv      *Server
 	pool     *pool.Pool
 	cfg      config.Pool
-	cache    *cache.Cache      // nil when disabled
-	prof     *profile.Profiler // nil when disabled
-	rewriter *rewrite.Rewriter // nil when disabled
+	cache    *cache.Cache       // nil when disabled
+	prof     *profile.Profiler  // nil when disabled
+	rewriter *rewrite.Rewriter  // nil when disabled
+	firewall *firewall.Firewall // nil when disabled
 	log      *slog.Logger
 
 	mu      sync.Mutex // guards conn, db, lastUse against the pinger
@@ -78,11 +81,13 @@ type session struct {
 func newSession(ctx context.Context, srv *Server, log *slog.Logger) *session {
 	s := &session{
 		ctx:      ctx,
+		srv:      srv,
 		pool:     srv.pool,
 		cfg:      srv.cfg,
 		cache:    srv.cache,
 		prof:     srv.prof,
 		rewriter: srv.rewriter,
+		firewall: srv.firewall,
 		log:      log,
 		mux:      srv.cfg.Multiplexing,
 		lastUse:  time.Now(),
@@ -103,6 +108,9 @@ func (s *session) close() {
 	if s.conn != nil {
 		s.pool.Release(s.conn)
 		s.conn = nil
+	}
+	if s.pinned {
+		s.srv.numPinned.Add(-1)
 	}
 }
 
@@ -199,6 +207,7 @@ func (s *session) pin(reason string) {
 		return
 	}
 	s.pinned = true
+	s.srv.numPinned.Add(1)
 	s.log.Debug("session pinned to its backend connection", "reason", reason)
 }
 
@@ -357,6 +366,14 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 		}
 	}
 
+	if s.firewall != nil {
+		if rule, blocked := s.firewall.Check(query); blocked {
+			s.log.Warn("query blocked", "rule", rule, "query", query)
+			return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR,
+				"query blocked by piko firewall rule '"+rule+"'")
+		}
+	}
+
 	kind := cache.Classify(query)
 
 	// Inside a transaction reads must see the session's own writes,
@@ -376,8 +393,10 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	stopWatchdog := s.queryWatchdog(c, query)
 	start := time.Now()
 	r, err := c.Execute(query)
+	stopWatchdog()
 	s.finish(err)
 	s.profile(query, time.Since(start), r, false, err)
 	if err != nil {
@@ -391,6 +410,25 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	}
 	s.maybeRelease()
 	return r, nil
+}
+
+// queryWatchdog kills the backend query when it exceeds max_query_time.
+// KILL QUERY interrupts the statement, not the connection: the client
+// receives a MySQL error and the session survives.
+func (s *session) queryWatchdog(c *pool.Conn, query string) func() {
+	if s.cfg.MaxQueryTime <= 0 || c.ThreadID == 0 {
+		return func() {}
+	}
+	threadID := c.ThreadID
+	limit := s.cfg.MaxQueryTime
+	timer := time.AfterFunc(limit, func() {
+		s.log.Warn("query exceeded max_query_time, killing it",
+			"max_query_time", limit, "query", query)
+		if err := s.pool.KillQuery(threadID); err != nil {
+			s.log.Error("failed to kill runaway query", "error", err)
+		}
+	})
+	return func() { timer.Stop() }
 }
 
 // profile forwards one execution to the profiler, when enabled.
@@ -492,6 +530,14 @@ func (s *session) HandleStmtPrepare(query string) (int, int, any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.firewall != nil {
+		if rule, blocked := s.firewall.Check(query); blocked {
+			s.log.Warn("prepared statement blocked", "rule", rule, "query", query)
+			return 0, 0, nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR,
+				"query blocked by piko firewall rule '"+rule+"'")
+		}
+	}
+
 	c, err := s.backend()
 	if err != nil {
 		return 0, 0, nil, err
@@ -515,8 +561,13 @@ func (s *session) HandleStmtExecute(context any, query string, args []any) (*mys
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	stopWatchdog := func() {}
+	if s.conn != nil {
+		stopWatchdog = s.queryWatchdog(s.conn, query)
+	}
 	start := time.Now()
 	r, err := stmt.Execute(args...)
+	stopWatchdog()
 	s.finish(err)
 	s.profile(query, time.Since(start), r, false, err)
 	if err == nil {

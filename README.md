@@ -59,7 +59,21 @@ configured with a single `config.yaml`.
   melts PHP-FPM. After `pool.breaker.failures` consecutive connection
   failures piko fails fast with a clean error and probes the backend until
   it recovers. `listen.max_connections` additionally caps concurrent client
-  connections.
+  connections, and `pool.max_query_time` kills (KILL QUERY) any statement
+  running longer than the limit so one runaway query can't hold a pool
+  connection hostage.
+- **Query firewall** — a `block` list in the conf.d drop-ins rejects
+  matching queries with a clean MySQL error before they reach the backend.
+  Combined with hot reload it's the emergency brake for a runaway plugin
+  query: add the rule and `systemctl reload piko`, no restart.
+- **TLS** — `listen.tls` (cert + key) encrypts client connections;
+  `backend.tls` encrypts the connection toward a remote MySQL, with an
+  optional custom CA. Both are off by default (localhost deployments need
+  no encryption).
+- **`piko status`** — a read-only unix socket (`status.socket`) exposes
+  live state; `piko status` prints connected clients, pinned sessions,
+  pool/breaker state and per-source cache hit ratios without waiting for
+  the periodic log report.
 
 ## Quick start
 
@@ -85,6 +99,12 @@ sudo ./piko                           # logs to /var/log/piko/piko.log
 
 `-config <path>` overrides the configuration path, both at startup and
 with `--init`.
+
+Check a running instance:
+
+```sh
+piko status                           # clients, pool, breaker, cache stats
+```
 
 Point WordPress at piko in `wp-config.php`:
 

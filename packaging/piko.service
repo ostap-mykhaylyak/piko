@@ -24,6 +24,8 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 ReadWritePaths=/var/log/piko
+RuntimeDirectory=piko
+RuntimeDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target
